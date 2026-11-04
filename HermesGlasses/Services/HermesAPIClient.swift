@@ -72,7 +72,10 @@ final class HermesAPIClient: NSObject {
 
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 10
-        let urlSession = URLSession(configuration: config)
+        // Redirects are refused: the Cloudflare Access headers and the
+        // bridge token must never follow a 3xx to another host.
+        let urlSession = URLSession(
+            configuration: config, delegate: BridgeNoRedirectDelegate(), delegateQueue: nil)
         session = urlSession
 
         let ws = urlSession.webSocketTask(with: request)
@@ -291,5 +294,21 @@ final class HermesAPIClient: NSObject {
         await MainActor.run { [weak self] in
             self?.onError?(message)
         }
+    }
+}
+
+/// Refuses every HTTP redirect on the bridge socket's session, so the
+/// credentials on the original request can never be replayed elsewhere.
+/// A separate object rather than the client itself: URLSession retains its
+/// delegate strongly until invalidated.
+final class BridgeNoRedirectDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
     }
 }
