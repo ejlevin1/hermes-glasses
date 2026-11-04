@@ -289,12 +289,12 @@ struct SettingsView: View {
     private func commitTypedValues() {
         // Credentials before the endpoint: setEndpoint kicks off a
         // reachability probe, which should already carry the new values.
-        hermesVM.setBridgeCredential(bridgeToken, for: .token)
+        hermesVM.setBridgeCredential(bridgeToken, for: .token, boundTo: endpoint)
         bridgeToken = ""
-        hermesVM.setBridgeCredential(accessClientSecret, for: .accessClientSecret)
+        hermesVM.setBridgeCredential(accessClientSecret, for: .accessClientSecret, boundTo: endpoint)
         accessClientSecret = ""
         if didLoadEndpoint {
-            hermesVM.setBridgeCredential(accessClientID, for: .accessClientID)
+            hermesVM.setBridgeCredential(accessClientID, for: .accessClientID, boundTo: endpoint)
         }
         hermesVM.setEndpoint(endpoint)
         if !providerKey.trimmingCharacters(in: .whitespaces).isEmpty {
@@ -1070,7 +1070,7 @@ private struct AssistantPage: View {
     private var bridgeAccessSection: some View {
         HermesSection(
             header: "Bridge access",
-            footer: "Needed only for a bridge reached over the internet. The token is sent to the bridge; the Cloudflare Access ID and secret are sent as headers, and only when both are set. All three are kept in this iPhone's Keychain. Leave a secret field empty to keep the saved value."
+            footer: "Needed only for a bridge reached over the internet. The token is sent to the bridge; the Cloudflare Access ID and secret are sent as headers, and only when both are set. All three are kept in this iPhone's Keychain. Leave a secret field empty to keep the saved value.\n\n" + boundHostFooter
         ) {
             secretFieldRow(
                 title: "Bridge token",
@@ -1102,6 +1102,21 @@ private struct AssistantPage: View {
                 clear: { hermesVM.clearBridgeCredential(.accessClientSecret) }
             )
         }
+    }
+
+    /// Names the host the saved secrets are bound to - never a secret value.
+    /// Saving any field binds all of them to the endpoint above.
+    private var boundHostFooter: String {
+        let host = hermesVM.bridgeCredentialHost
+        let anySaved = hermesVM.hasBridgeToken || hermesVM.hasBridgeAccessSecret
+            || !hermesVM.bridgeAccessClientID.isEmpty
+        guard anySaved else {
+            return "Secrets you save apply only to the host of the endpoint above, over wss://."
+        }
+        guard !host.isEmpty else {
+            return "Saved secrets are not sent to any host. Save them again to use them with the endpoint above."
+        }
+        return "Saved secrets are sent only to \(host), over wss://. Save them again to use another host."
     }
 
     /// A SecureField that never shows what is stored, with a status line

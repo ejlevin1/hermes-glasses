@@ -371,17 +371,29 @@ final class HermesSessionViewModel {
     /// shows it in a plain field to make a wrong paste visible.
     var bridgeAccessClientID: String = BridgeCredentialStore.value(for: .accessClientID) ?? ""
 
+    /// The endpoint host the saved secrets are bound to (non-secret, for the
+    /// Settings footer). Empty = bound to nothing, so nothing is sent.
+    var bridgeCredentialHost: String = BridgeCredentialStore.boundHost
+
     func reloadBridgeCredentialState() {
+        BridgeCredentialStore.migrateBoundHostIfNeeded(currentEndpoint: hermesEndpoint)
         hasBridgeToken = BridgeCredentialStore.has(.token)
         hasBridgeAccessSecret = BridgeCredentialStore.has(.accessClientSecret)
         bridgeAccessClientID = BridgeCredentialStore.value(for: .accessClientID) ?? ""
+        bridgeCredentialHost = BridgeCredentialStore.boundHost
     }
 
     /// Save a typed bridge secret. Empty input is NOT a delete for the two
     /// SecureFields (their text is never pre-filled, so empty just means
     /// "left alone"); use `clearBridgeCredential` for that. The client ID is
     /// shown pre-filled, so for it empty does mean remove.
-    func setBridgeCredential(_ value: String, for field: BridgeCredentialStore.Field) {
+    ///
+    /// `endpoint` is the endpoint the value was typed for (the one in the
+    /// Settings field, which may not be committed yet): every saved secret is
+    /// bound to its host and only ever sent to that host over `wss://`.
+    func setBridgeCredential(
+        _ value: String, for field: BridgeCredentialStore.Field, boundTo endpoint: String
+    ) {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         switch field {
         case .token, .accessClientSecret:
@@ -390,6 +402,11 @@ final class HermesSessionViewModel {
             guard trimmed != bridgeAccessClientID else { return }
         }
         BridgeCredentialStore.set(trimmed, for: field)
+        if trimmed.isEmpty {
+            BridgeCredentialStore.unbindIfEmpty()
+        } else {
+            BridgeCredentialStore.bind(toEndpoint: endpoint)
+        }
         reloadBridgeCredentialState()
         if !trimmed.isEmpty, BridgeCredentialStore.value(for: field) == nil {
             show("Could not save the bridge credential to the Keychain.")
@@ -398,14 +415,18 @@ final class HermesSessionViewModel {
 
     func clearBridgeCredential(_ field: BridgeCredentialStore.Field) {
         BridgeCredentialStore.clear(field)
+        BridgeCredentialStore.unbindIfEmpty()
         reloadBridgeCredentialState()
     }
 
     /// The ONE way a bridge client is made - session, launch probe and the
     /// Developer test panel all go through it, so they all carry the same
     /// token and Cloudflare Access headers.
+    /// The secrets only attach when the endpoint is the `wss://` host they
+    /// were saved for (`BridgeRequestBuilder.request`).
     private func makeAPIClient() -> HermesAPIClient {
-        HermesAPIClient(endpoint: hermesEndpoint, credentials: BridgeCredentialStore.load())
+        BridgeCredentialStore.migrateBoundHostIfNeeded(currentEndpoint: hermesEndpoint)
+        return HermesAPIClient(endpoint: hermesEndpoint, credentials: BridgeCredentialStore.load())
     }
 
     // MARK: - Constants

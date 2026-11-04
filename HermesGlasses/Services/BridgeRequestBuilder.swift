@@ -17,6 +17,11 @@
 // set the request is exactly `URLRequest(url: URL(string: endpoint))`, so a
 // LAN `ws://host:8765/voice` keeps working as it always did.
 //
+// The saved secrets are BOUND to the host they were entered for
+// (`BridgeCredentials.boundHost`). They are attached only when the endpoint's
+// host equals that host (case-insensitive) AND the scheme is `wss` - a preset
+// tap, a typo or a cleartext `ws://` URL must never carry them anywhere else.
+//
 
 import Foundation
 
@@ -26,6 +31,9 @@ struct BridgeCredentials: Equatable {
     var token: String = ""
     var accessClientID: String = ""
     var accessClientSecret: String = ""
+    /// The endpoint host the secrets were saved for. Not a secret (kept in
+    /// UserDefaults). Empty = bound to nothing, so nothing is sent.
+    var boundHost: String = ""
 
     static let empty = BridgeCredentials()
 
@@ -35,7 +43,8 @@ struct BridgeCredentials: Equatable {
         BridgeCredentials(
             token: token.trimmingCharacters(in: .whitespacesAndNewlines),
             accessClientID: accessClientID.trimmingCharacters(in: .whitespacesAndNewlines),
-            accessClientSecret: accessClientSecret.trimmingCharacters(in: .whitespacesAndNewlines)
+            accessClientSecret: accessClientSecret.trimmingCharacters(in: .whitespacesAndNewlines),
+            boundHost: boundHost.trimmingCharacters(in: .whitespacesAndNewlines)
         )
     }
 
@@ -113,10 +122,42 @@ enum BridgeRequestBuilder {
         }
     }
 
+    /// The host to bind newly saved secrets to: the endpoint's host,
+    /// lowercased, or nil when the endpoint has none.
+    static func host(of endpoint: String) -> String? {
+        let trimmed = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let host = URL(string: trimmed)?.host, !host.isEmpty else { return nil }
+        return host.lowercased()
+    }
+
+    /// Migration for secrets saved before host binding existed: bind them to
+    /// the current endpoint's host only when that endpoint is `wss://`;
+    /// otherwise nil (send nothing until the user saves them again).
+    static func migratedBoundHost(currentEndpoint: String) -> String? {
+        let trimmed = currentEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard URL(string: trimmed)?.scheme?.lowercased() == "wss" else { return nil }
+        return host(of: trimmed)
+    }
+
+    /// Whether secrets bound to `boundHost` may travel on a request to `url`:
+    /// same host (case-insensitive) and an encrypted `wss` scheme.
+    static func secretsAllowed(for url: URL, boundHost: String) -> Bool {
+        let bound = boundHost.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !bound.isEmpty, let host = url.host?.lowercased(), host == bound
+        else { return false }
+        return url.scheme?.lowercased() == "wss"
+    }
+
     /// The request to open the WebSocket with. Secrets go in headers (CF)
-    /// and the query (bridge token) only - nothing else is added.
+    /// and the query (bridge token) only - nothing else is added - and only
+    /// when `secretsAllowed` says the endpoint is the host they belong to.
+    /// A `?token=` the user typed into the endpoint is theirs and is kept.
     static func request(endpoint: String, credentials: BridgeCredentials) -> URLRequest? {
         let creds = credentials.trimmed
+        guard let plain = url(endpoint: endpoint, token: "") else { return nil }
+        guard secretsAllowed(for: plain, boundHost: creds.boundHost) else {
+            return URLRequest(url: plain)
+        }
         guard let url = url(endpoint: endpoint, token: creds.token) else { return nil }
         var request = URLRequest(url: url)
         if creds.hasAccessToken {

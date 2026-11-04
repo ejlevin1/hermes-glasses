@@ -13,6 +13,7 @@ func expect(_ c: Bool, _ label: String) {
 }
 
 let remote = "wss://glasses.example.com/voice"
+let remoteHost = "glasses.example.com"
 let lan = "ws://192.168.1.20:8765/voice"
 
 // MARK: - URL building
@@ -81,7 +82,7 @@ expect(bare?.allHTTPHeaderFields?.isEmpty ?? true, "no credentials: no headers")
 let both = BridgeRequestBuilder.request(
     endpoint: remote,
     credentials: BridgeCredentials(token: "", accessClientID: "id.access",
-                                   accessClientSecret: "s3cret"))
+                                   accessClientSecret: "s3cret", boundHost: remoteHost))
 expect(header(both, idH) == "id.access", "both set: client id header")
 expect(header(both, secretH) == "s3cret", "both set: client secret header")
 expect(both?.url?.absoluteString == remote, "CF credentials never go in the URL")
@@ -90,30 +91,32 @@ expect(!(both?.url?.absoluteString.contains("id.access") ?? true), "client id ab
 
 // Only one half -> neither header
 let onlyID = BridgeRequestBuilder.request(
-    endpoint: remote, credentials: BridgeCredentials(accessClientID: "id.access"))
+    endpoint: remote, credentials: BridgeCredentials(accessClientID: "id.access", boundHost: remoteHost))
 expect(header(onlyID, idH) == nil && header(onlyID, secretH) == nil,
        "client id without secret: no headers")
 let onlySecret = BridgeRequestBuilder.request(
-    endpoint: remote, credentials: BridgeCredentials(accessClientSecret: "s3cret"))
+    endpoint: remote, credentials: BridgeCredentials(accessClientSecret: "s3cret", boundHost: remoteHost))
 expect(header(onlySecret, idH) == nil && header(onlySecret, secretH) == nil,
        "secret without client id: no headers")
 let blankID = BridgeRequestBuilder.request(
     endpoint: remote,
-    credentials: BridgeCredentials(accessClientID: "  ", accessClientSecret: "s3cret"))
+    credentials: BridgeCredentials(accessClientID: "  ", accessClientSecret: "s3cret",
+                                   boundHost: remoteHost))
 expect(header(blankID, secretH) == nil, "whitespace client id counts as missing")
 
 // Values are trimmed (pasted with a trailing newline)
 let pasted = BridgeRequestBuilder.request(
     endpoint: remote,
     credentials: BridgeCredentials(token: " tok\n", accessClientID: "id\n",
-                                   accessClientSecret: "\tsec "))
+                                   accessClientSecret: "\tsec ", boundHost: " \(remoteHost)\n"))
 expect(header(pasted, idH) == "id" && header(pasted, secretH) == "sec", "header values trimmed")
 expect(pasted?.url?.absoluteString == "\(remote)?token=tok", "token trimmed")
 
 // Everything together
 let full = BridgeRequestBuilder.request(
     endpoint: remote,
-    credentials: BridgeCredentials(token: "tok", accessClientID: "id", accessClientSecret: "sec"))
+    credentials: BridgeCredentials(token: "tok", accessClientID: "id", accessClientSecret: "sec",
+                                   boundHost: remoteHost))
 expect(full?.url?.absoluteString == "\(remote)?token=tok", "full: token in URL")
 expect(header(full, idH) == "id" && header(full, secretH) == "sec", "full: both headers")
 expect(full?.allHTTPHeaderFields?.count == 2, "full: no other headers added")
@@ -135,6 +138,98 @@ expect(BridgeRequestBuilder.failureHint(httpStatus: nil, closeCode: nil) == nil,
        "no status, no close code: no hint (transport error is used)")
 expect(BridgeRequestBuilder.failureHint(httpStatus: 101, closeCode: 1000) == nil,
        "normal close: no hint")
+
+
+// MARK: - Host binding (secrets only go to the wss:// host they were saved for)
+
+let allSecrets = BridgeCredentials(token: "tok", accessClientID: "id", accessClientSecret: "sec",
+                                   boundHost: remoteHost)
+func noSecrets(_ r: URLRequest?, _ expectedURL: String, _ label: String) {
+    expect(r?.url?.absoluteString == expectedURL, "\(label): URL unchanged")
+    expect(header(r, idH) == nil && header(r, secretH) == nil, "\(label): no CF headers")
+    expect(r?.allHTTPHeaderFields?.isEmpty ?? true, "\(label): no headers at all")
+    expect(!(r?.url?.absoluteString.contains("tok") ?? true), "\(label): no token")
+}
+
+// Different host -> nothing
+let otherHost = "wss://evil.example.net/voice"
+noSecrets(BridgeRequestBuilder.request(endpoint: otherHost, credentials: allSecrets),
+          otherHost, "different host")
+// Subdomain / suffix tricks are different hosts too
+let suffixHost = "wss://glasses.example.com.evil.net/voice"
+noSecrets(BridgeRequestBuilder.request(endpoint: suffixHost, credentials: allSecrets),
+          suffixHost, "bound host as a prefix of another host")
+let userinfoTrick = "wss://glasses.example.com@evil.net/voice"
+noSecrets(BridgeRequestBuilder.request(endpoint: userinfoTrick, credentials: allSecrets),
+          userinfoTrick, "bound host as userinfo")
+
+// Same host over cleartext ws:// -> nothing
+let sameHostWS = "ws://glasses.example.com/voice"
+noSecrets(BridgeRequestBuilder.request(endpoint: sameHostWS, credentials: allSecrets),
+          sameHostWS, "same host over ws://")
+// ...and https:// is not a WebSocket scheme we send secrets on either
+let sameHostHTTPS = "https://glasses.example.com/voice"
+noSecrets(BridgeRequestBuilder.request(endpoint: sameHostHTTPS, credentials: allSecrets),
+          sameHostHTTPS, "same host over https://")
+
+// Same host over wss:// -> both
+let sameHost = BridgeRequestBuilder.request(endpoint: remote, credentials: allSecrets)
+expect(sameHost?.url?.absoluteString == "\(remote)?token=tok", "same host wss: token")
+expect(header(sameHost, idH) == "id" && header(sameHost, secretH) == "sec",
+       "same host wss: CF headers")
+// Case-insensitive host and scheme, either side
+let upperEndpoint = "WSS://Glasses.EXAMPLE.com/voice"
+let upper = BridgeRequestBuilder.request(endpoint: upperEndpoint, credentials: allSecrets)
+expect(header(upper, idH) == "id" && header(upper, secretH) == "sec",
+       "different case endpoint: CF headers")
+expect(upper?.url?.query == "token=tok", "different case endpoint: token")
+var upperBound = allSecrets
+upperBound.boundHost = "GLASSES.Example.COM"
+let upperB = BridgeRequestBuilder.request(endpoint: remote, credentials: upperBound)
+expect(header(upperB, idH) == "id" && upperB?.url?.query == "token=tok",
+       "different case bound host: both")
+// Port does not change the host
+let withPort = "wss://glasses.example.com:8443/voice"
+let ported = BridgeRequestBuilder.request(endpoint: withPort, credentials: allSecrets)
+expect(header(ported, idH) == "id" && ported?.url?.query == "token=tok",
+       "same host, explicit port: both")
+
+// Bound host unset -> nothing, even on the right wss:// endpoint
+var unbound = allSecrets
+unbound.boundHost = ""
+noSecrets(BridgeRequestBuilder.request(endpoint: remote, credentials: unbound),
+          remote, "bound host unset")
+unbound.boundHost = "   "
+noSecrets(BridgeRequestBuilder.request(endpoint: remote, credentials: unbound),
+          remote, "bound host whitespace")
+
+// A ?token= the user typed into the URL is theirs and is kept, bound or not
+let typed = "ws://192.168.1.20:8765/voice?token=mine"
+let typedReq = BridgeRequestBuilder.request(endpoint: typed, credentials: allSecrets)
+expect(typedReq?.url?.absoluteString == typed, "user-typed token kept (other host, ws)")
+expect(header(typedReq, idH) == nil, "user-typed token, other host: no CF headers")
+let typedRemote = "\(remote)?token=mine"
+let typedRemoteReq = BridgeRequestBuilder.request(endpoint: typedRemote, credentials: allSecrets)
+expect(typedRemoteReq?.url?.absoluteString == typedRemote,
+       "user-typed token kept on bound host, Keychain token not added")
+expect(header(typedRemoteReq, idH) == "id", "user-typed token on bound host: CF headers still sent")
+let typedUnbound = BridgeRequestBuilder.request(endpoint: typedRemote, credentials: .empty)
+expect(typedUnbound?.url?.absoluteString == typedRemote, "user-typed token kept, no credentials")
+
+// Empty credentials -> exactly URLRequest(url:)
+let emptyBound = BridgeRequestBuilder.request(endpoint: remote, credentials: .empty)
+expect(emptyBound == URLRequest(url: URL(string: remote)!), "empty credentials: bare URLRequest(url:)")
+
+// Host helpers
+expect(BridgeRequestBuilder.host(of: "  WSS://Glasses.Example.com/voice\n") == remoteHost,
+       "host(of:) lowercases + trims")
+expect(BridgeRequestBuilder.host(of: "not a url") == nil, "host(of:) nil for garbage")
+expect(BridgeRequestBuilder.migratedBoundHost(currentEndpoint: remote) == remoteHost,
+       "migration binds a wss:// endpoint's host")
+expect(BridgeRequestBuilder.migratedBoundHost(currentEndpoint: lan) == nil,
+       "migration binds nothing for ws://")
+expect(BridgeRequestBuilder.migratedBoundHost(currentEndpoint: "") == nil,
+       "migration binds nothing for an empty endpoint")
 
 print(failures == 0 ? "\nALL PASS" : "\n\(failures) FAILURES")
 exit(failures == 0 ? 0 : 1)
