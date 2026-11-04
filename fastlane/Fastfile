@@ -275,6 +275,14 @@ platform :ios do
     }
     latest = latest_testflight_build_number(**latest_args)
     build_number = latest.to_i + 1
+    # An upload that Apple rejects during processing (e.g. ITMS-90683) never
+    # becomes a TestFlight build, so "latest + 1" would reuse its number and
+    # the next upload is refused as a duplicate. `build_number:<n>` overrides.
+    unless options[:build_number].to_s.strip.empty?
+      requested = Integer(options[:build_number].to_s.strip, 10)
+      UI.user_error!("build_number #{requested} must be greater than the latest TestFlight build #{latest}") if requested <= latest.to_i
+      build_number = requested
+    end
     UI.success("Building build number #{build_number}")
 
     # Passed to xcodebuild rather than written into the tree (no agvtool:
