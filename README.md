@@ -167,6 +167,13 @@ Binary frames from the app are reserved for mic audio (legacy server-side STT
 path, still supported by the bridge). The bridge's `HERMES_BRIDGE_BRAIN` env
 var now supports `anthropic` / `openai` / `gemini` (direct provider call) in
 addition to the default `hermes` (agentic CLI with tools + memory).
+`hermes-api` talks to the always-running Hermes gateway's OpenAI-compatible
+API instead of spawning the CLI per question (same agent, tools and memory,
+minus ~2 s of CLI boot). Set `HERMES_API_URL` (default
+`http://127.0.0.1:8642/v1/chat/completions`) and `HERMES_API_KEY` (bearer,
+required); the bridge sends only the new message plus an
+`X-Hermes-Session-Id` header (`glasses-<date>-<id>`, same-day reuse, reset by
+the app's new-chat) and the gateway supplies the history.
 
 ## Setup
 

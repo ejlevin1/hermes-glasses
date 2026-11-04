@@ -459,6 +459,426 @@ class AskHermesChildProcessTests(unittest.TestCase):
             env_without,
         )
 
+# ── Hermes gateway API brain (BRAIN="hermes-api") ──────────────────────────
+import contextlib
+import http.server
+import io
+import json
+import re
+import threading
+import time
+import urllib.request
+
+FAKE_KEY = "sk-test-SECRET-key-0123456789"
+
+
+class FakeGateway:
+    """Local OpenAI-compatible fake on 127.0.0.1:<free port>.
+
+    `responses` is a queue of (status, body_dict, delay_s[, headers]); the last entry
+    repeats once the queue is drained. Every request is recorded.
+    """
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.requests = []
+        gateway = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length)
+                gateway.requests.append({
+                    "path": self.path,
+                    "headers": {k.lower(): v for k, v in self.headers.items()},
+                    "body": json.loads(raw.decode()),
+                })
+                if len(gateway.responses) > 1:
+                    entry = gateway.responses.pop(0)
+                else:
+                    entry = gateway.responses[0]
+                status, body, delay = entry[:3]
+                extra_headers = entry[3] if len(entry) > 3 else {}
+                if delay:
+                    time.sleep(delay)
+                payload = json.dumps(body).encode()
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
+                    for name, value in extra_headers.items():
+                        self.send_header(name, value)
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                except OSError:
+                    pass  # client gave up (timeout test)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+
+    @property
+    def url(self):
+        return "http://127.0.0.1:%d/p/hostbot/v1/chat/completions" % self.port
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class QuerySocket(FakeWebSocket):
+    """Drives handle_connection: yields each queued message, then closes."""
+    remote_address = ("127.0.0.1", 1)
+    request = None
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._messages:
+            raise StopAsyncIteration
+        return self._messages.pop(0)
+
+
+class _FakeResponse:
+    def __init__(self, status=200, body=b"", read_error=None):
+        self.status, self._body, self._read_error = status, body, read_error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        if self._read_error:
+            raise self._read_error
+        return self._body
+
+
+def ok_reply(text):
+    return (200, {"choices": [{"message": {"role": "assistant",
+                                           "content": text}}]}, 0)
+
+
+class HermesApiBrainTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmpdir, True))
+        saved = {name: getattr(hb, name) for name in (
+            "BRAIN", "BRIDGE_TTS", "SESSION_FILE", "API_SESSION_FILE",
+            "HERMES_API_URL", "HERMES_API_TIMEOUT")}
+
+        def restore():
+            for name, value in saved.items():
+                setattr(hb, name, value)
+        self.addCleanup(restore)
+        hb.BRAIN = "hermes-api"
+        hb.BRIDGE_TTS = False
+        hb.SESSION_FILE = os.path.join(self.tmpdir, "cli_session.json")
+        hb.API_SESSION_FILE = os.path.join(self.tmpdir, "api_session.json")
+        hb.HERMES_API_TIMEOUT = 5.0
+        env = unittest.mock.patch.dict(os.environ, {"HERMES_API_KEY": FAKE_KEY})
+        env.start()
+        self.addCleanup(env.stop)
+        self.log = io.StringIO()
+
+    def gateway(self, responses):
+        gw = FakeGateway(responses)
+        self.addCleanup(gw.close)
+        hb.HERMES_API_URL = gw.url
+        return gw
+
+    def ask(self, text, ws=None):
+        """Run one process_query turn; returns the response frame dict."""
+        ws = ws or FakeWebSocket([])
+        with contextlib.redirect_stdout(self.log):
+            asyncio.run(hb.process_query(ws, text))
+        frames = [json.loads(m) for m in ws.sent if isinstance(m, str)]
+        responses = [f for f in frames if f.get("type") == "response"]
+        self.assertEqual(len(responses), 1)
+        return responses[0]
+
+    def assertKeyNowhere(self, *texts):
+        for t in list(texts) + [self.log.getvalue()]:
+            self.assertNotIn(FAKE_KEY, t)
+            self.assertNotIn("SECRET", t)
+
+    # ── request shape ──
+    def test_request_path_auth_and_single_message(self):
+        gw = self.gateway([ok_reply("Hi there.")])
+        reply = self.ask("tell me a joke")
+        self.assertEqual(reply["text"], "Hi there.")
+        self.assertEqual(len(gw.requests), 1)
+        req = gw.requests[0]
+        self.assertEqual(req["path"], "/p/hostbot/v1/chat/completions")
+        self.assertEqual(req["headers"]["authorization"], "Bearer " + FAKE_KEY)
+        self.assertEqual(req["headers"]["content-type"], "application/json")
+        body = req["body"]
+        self.assertEqual(body["model"], "hermes")
+        self.assertIs(body["stream"], False)
+        self.assertEqual(len(body["messages"]), 1)
+        self.assertEqual(body["messages"][0]["role"], "user")
+        # First turn carries the voice persona, like the CLI brain
+        self.assertIn("voice assistant", body["messages"][0]["content"])
+        self.assertTrue(body["messages"][0]["content"].endswith("tell me a joke"))
+        self.assertKeyNowhere(json.dumps(reply))
+
+    def test_session_header_on_first_and_second_turn_and_stable(self):
+        gw = self.gateway([ok_reply("One."), ok_reply("Two.")])
+        self.ask("first question")
+        self.ask("second question")
+        ids = [r["headers"].get("x-hermes-session-id") for r in gw.requests]
+        self.assertEqual(len(ids), 2)
+        self.assertIsNotNone(ids[0])
+        self.assertRegex(ids[0], r"^glasses-\d{8}-[0-9a-f]{12}$")
+        self.assertEqual(ids[0], ids[1])
+        # Second turn: only the new message, no persona, no history
+        second = gw.requests[1]["body"]["messages"]
+        self.assertEqual(second, [{"role": "user", "content": "second question"}])
+        self.assertIn("[Bridge] Asking Hermes API... (session: %s)" % ids[0],
+                      self.log.getvalue())
+        self.assertRegex(self.log.getvalue(), r"\[Bridge\] Hermes \(\d+\.\ds\): ")
+
+    def test_image_part_shape(self):
+        gw = self.gateway([ok_reply("A mug.")])
+        jpeg = b"\xff\xd8\xff\xe0fakejpeg"
+        ws = FakeWebSocket([
+            '{"type":"photo","data":"%s"}' % base64.b64encode(jpeg).decode()])
+        self.ask("what am I looking at", ws)
+        content = gw.requests[0]["body"]["messages"][0]["content"]
+        self.assertIsInstance(content, list)
+        self.assertEqual(len(content), 2)
+        self.assertEqual(content[0]["type"], "text")
+        self.assertTrue(content[0]["text"].endswith("what am I looking at"))
+        self.assertEqual(content[1], {"type": "image_url", "image_url": {
+            "url": "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()}})
+        self.assertIsNotNone(gw.requests[0]["headers"].get("x-hermes-session-id"))
+
+    # ── errors ──
+    def test_409_retries_once_with_fresh_id_and_stores_it(self):
+        hb.store_api_session("glasses-20260101-aaaaaaaaaaaa")
+        gw = self.gateway([
+            (409, {"error": {"message": "session busy"}}, 0),
+            ok_reply("Recovered."),
+        ])
+        reply = self.ask("hello")
+        self.assertEqual(reply["text"], "Recovered.")
+        self.assertEqual(len(gw.requests), 2)
+        first = gw.requests[0]["headers"]["x-hermes-session-id"]
+        second = gw.requests[1]["headers"]["x-hermes-session-id"]
+        self.assertEqual(first, "glasses-20260101-aaaaaaaaaaaa")
+        self.assertNotEqual(first, second)
+        self.assertRegex(second, r"^glasses-\d{8}-[0-9a-f]{12}$")
+        self.assertEqual(hb.load_api_session(), second)
+        # Fresh server session → persona again
+        self.assertIn("voice assistant",
+                      gw.requests[1]["body"]["messages"][0]["content"])
+
+    def test_409_twice_retries_only_once(self):
+        gw = self.gateway([(409, {"error": {"message": "busy"}}, 0)])
+        reply = self.ask("hello")
+        self.assertEqual(len(gw.requests), 2)
+        self.assertEqual(reply["text"],
+                         "Hermes is unavailable right now (HTTP 409).")
+
+    def test_500_returns_friendly_text_and_logs_message(self):
+        long_msg = "boom " + "x" * 500
+        self.gateway([(500, {"error": {"message": long_msg}}, 0)])
+        reply = self.ask("hello")
+        self.assertEqual(reply["text"],
+                         "Hermes is unavailable right now (HTTP 500).")
+        log = self.log.getvalue()
+        self.assertIn("HTTP 500: boom", log)
+        line = next(l for l in log.splitlines() if "HTTP 500:" in l)
+        self.assertLessEqual(len(line.split("HTTP 500: ", 1)[1]), 200)
+        self.assertNotIn("x" * 201, log)
+        self.assertKeyNowhere(json.dumps(reply))
+        # Failed turn stores nothing
+        self.assertIsNone(hb.load_api_session())
+
+    def test_server_error_echoing_key_is_redacted(self):
+        self.gateway([(401, {"error": {"message": "bad key " + FAKE_KEY}}, 0)])
+        reply = self.ask("hello")
+        self.assertEqual(reply["text"],
+                         "Hermes is unavailable right now (HTTP 401).")
+        self.assertKeyNowhere(json.dumps(reply))
+
+    def test_timeout_returns_friendly_text(self):
+        hb.HERMES_API_TIMEOUT = 0.3
+        self.gateway([(200, {"choices": []}, 1.5)])
+        reply = self.ask("hello")
+        self.assertEqual(reply["text"], "Sorry, Hermes took too long to respond.")
+        self.assertKeyNowhere(json.dumps(reply))
+
+    def test_connection_refused_returns_friendly_text(self):
+        gw = self.gateway([ok_reply("never")])
+        gw.close()
+        reply = self.ask("hello")
+        self.assertEqual(reply["text"], "Hermes is unavailable right now.")
+        self.assertKeyNowhere(json.dumps(reply))
+
+    def test_empty_content_returns_no_reply_text(self):
+        self.gateway([ok_reply("")])
+        reply = self.ask("hello")
+        self.assertEqual(reply["text"], "Hermes didn't return a reply.")
+
+    def test_missing_key_is_a_startup_error_and_a_spoken_error(self):
+        with unittest.mock.patch.dict(os.environ, {"HERMES_API_KEY": ""}):
+            self.assertIn("HERMES_API_KEY", hb.check_brain_config("hermes-api"))
+            reply, stored = hb.ask_hermes_api("hi", None, "glasses-x", True)
+        self.assertIn("HERMES_API_KEY", reply)
+        self.assertIsNone(stored)
+        self.assertIsNone(hb.check_brain_config("hermes-api"))
+        self.assertIsNone(hb.check_brain_config("hermes"))
+
+    def test_main_exits_without_key(self):
+        hb.BRAIN = "hermes-api"
+        with unittest.mock.patch.dict(os.environ, {"HERMES_API_KEY": ""}):
+            with contextlib.redirect_stdout(self.log):
+                with self.assertRaises(SystemExit):
+                    asyncio.run(hb.main())
+        self.assertIn("HERMES_API_KEY", self.log.getvalue())
+
+    # ── session store ──
+    def test_new_session_rotates_the_id(self):
+        gw = self.gateway([ok_reply("One."), ok_reply("Two.")])
+        self.ask("first")
+
+        ws = QuerySocket(['{"type":"new_session"}'])
+        with contextlib.redirect_stdout(self.log):
+            asyncio.run(hb.handle_connection(ws))
+        self.assertIsNone(hb.load_api_session())
+        self.ask("second")
+        ids = [r["headers"]["x-hermes-session-id"] for r in gw.requests]
+        self.assertNotEqual(ids[0], ids[1])
+        self.assertIn("voice assistant",
+                      gw.requests[1]["body"]["messages"][0]["content"])
+
+    def test_stale_api_session_not_reused(self):
+        with open(hb.API_SESSION_FILE, "w") as f:
+            json.dump({"session_id": "glasses-20000101-000000000000",
+                       "date": "2000-01-01"}, f)
+        self.assertIsNone(hb.load_api_session())
+
+    def test_cli_session_store_untouched_and_never_sent(self):
+        hb.store_session("local-20260710_000000_cli")
+        with open(hb.SESSION_FILE) as f:
+            before = f.read()
+        gw = self.gateway([ok_reply("One."), ok_reply("Two.")])
+        self.ask("first")
+        self.ask("second")
+        with open(hb.SESSION_FILE) as f:
+            self.assertEqual(f.read(), before)
+        for r in gw.requests:
+            self.assertTrue(
+                r["headers"]["x-hermes-session-id"].startswith("glasses-"))
+        self.assertNotEqual(hb.SESSION_FILE, hb.API_SESSION_FILE)
+
+    # ── fix round: R1 (never raise), R2 (no redirects / proxies), R3 ──
+    def test_malformed_url_returns_friendly_text(self):
+        for bad in ("not a url", "ftp//127.0.0.1/x", "http://[::1"):
+            hb.HERMES_API_URL = bad
+            reply = self.ask("hello")
+            self.assertEqual(reply["text"], "Hermes is unavailable right now.")
+        self.assertKeyNowhere(json.dumps(reply))
+        self.assertIsNone(hb.load_api_session())
+
+    def test_incomplete_read_returns_friendly_text(self):
+        import http.client
+        err = http.client.IncompleteRead(b"partial " + FAKE_KEY.encode(), 99)
+        with unittest.mock.patch.object(
+                hb._HERMES_API_OPENER, "open",
+                return_value=_FakeResponse(read_error=err)):
+            reply = self.ask("hello")
+        self.assertEqual(reply["text"], "Hermes is unavailable right now.")
+        self.assertIn("[Hermes API] IncompleteRead", self.log.getvalue())
+        self.assertKeyNowhere(json.dumps(reply))
+
+    def test_ws_loop_keeps_running_after_unexpected_error(self):
+        import http.client
+        ok = json.dumps({"choices": [{"message": {"content": "Second."}}]})
+        with unittest.mock.patch.object(
+                hb._HERMES_API_OPENER, "open", side_effect=[
+                    _FakeResponse(read_error=http.client.IncompleteRead(b"", 5)),
+                    _FakeResponse(body=ok.encode())]):
+            ws = QuerySocket(['{"type":"query","text":"first"}',
+                              '{"type":"query","text":"second"}'])
+            with contextlib.redirect_stdout(self.log):
+                asyncio.run(hb.handle_connection(ws))
+        texts = [json.loads(m).get("text") for m in ws.sent
+                 if isinstance(m, str) and json.loads(m).get("type") == "response"]
+        self.assertEqual(texts, ["Hermes is unavailable right now.", "Second."])
+
+    def test_check_brain_config_rejects_non_http_url(self):
+        for bad in ("127.0.0.1:8642/v1/chat/completions", "ftp://x/y", ""):
+            hb.HERMES_API_URL = bad
+            self.assertIn("HERMES_API_URL", hb.check_brain_config("hermes-api"))
+        for good in ("http://127.0.0.1:8642/v1/chat/completions",
+                     "https://gw.example/p/hostbot/v1/chat/completions"):
+            hb.HERMES_API_URL = good
+            self.assertIsNone(hb.check_brain_config("hermes-api"))
+        hb.HERMES_API_URL = "ftp://x/y"
+        self.assertIsNone(hb.check_brain_config("hermes"))
+
+    def test_main_exits_on_bad_url(self):
+        hb.HERMES_API_URL = "127.0.0.1:8642/v1/chat/completions"
+        with contextlib.redirect_stdout(self.log):
+            with self.assertRaises(SystemExit):
+                asyncio.run(hb.main())
+        self.assertIn("FATAL: HERMES_API_URL", self.log.getvalue())
+        self.assertKeyNowhere()
+
+    def test_redirect_is_refused_and_key_not_resent(self):
+        target = FakeGateway([ok_reply("should never be asked")])
+        self.addCleanup(target.close)
+        self.gateway([(302, {}, 0, {"Location": target.url})])
+        reply = self.ask("hello")
+        self.assertEqual(reply["text"],
+                         "Hermes is unavailable right now (HTTP 302).")
+        self.assertEqual(target.requests, [])
+        self.assertIsNone(hb.load_api_session())
+        self.assertKeyNowhere(json.dumps(reply))
+
+    def test_opener_ignores_proxy_environment(self):
+        proxy = FakeGateway([ok_reply("via proxy")])
+        self.addCleanup(proxy.close)
+        gw = self.gateway([ok_reply("Direct.")])
+        env = {k: "" for k in ("no_proxy", "NO_PROXY")}
+        env.update({"http_proxy": "http://127.0.0.1:%d" % proxy.port,
+                    "HTTP_PROXY": "http://127.0.0.1:%d" % proxy.port})
+        with unittest.mock.patch.dict(os.environ, env):
+            reply = self.ask("hello")
+        self.assertEqual(reply["text"], "Direct.")
+        self.assertEqual(proxy.requests, [])
+        self.assertEqual(len(gw.requests), 1)
+
+    def test_409_twice_clears_stored_session(self):
+        hb.store_api_session("glasses-20260101-aaaaaaaaaaaa")
+        gw = self.gateway([(409, {"error": {"message": "busy"}}, 0)])
+        self.ask("hello")
+        self.assertEqual(len(gw.requests), 2)
+        self.assertIsNone(hb.load_api_session())
+        # Next turn starts a fresh session (persona again), not the stale id
+        gw.responses = [ok_reply("Back.")]
+        self.ask("again")
+        third = gw.requests[2]
+        self.assertNotEqual(third["headers"]["x-hermes-session-id"],
+                            "glasses-20260101-aaaaaaaaaaaa")
+        self.assertIn("voice assistant", third["body"]["messages"][0]["content"])
+
+    def test_session_id_format(self):
+        sid = hb.new_api_session_id()
+        today = __import__("datetime").date.today().strftime("%Y%m%d")
+        self.assertTrue(re.fullmatch(r"glasses-%s-[0-9a-f]{12}" % today, sid))
+        self.assertNotEqual(sid, hb.new_api_session_id())
+
 
 if __name__ == "__main__":
     unittest.main()
