@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import wave
 import urllib.error
 import urllib.request
@@ -515,6 +516,198 @@ def ask_hermes(
         return f"Error: {e}", None
 
 
+# ── Hermes gateway API brain (BRAIN="hermes-api") ──────────────────────────
+# The always-running Hermes gateway serves an OpenAI-compatible chat API on
+# the same Mac. Calling it skips the 1.6-2.5 s CLI boot `ask_hermes` pays on
+# every utterance. Conversation memory lives server-side: the gateway loads
+# the history for the X-Hermes-Session-Id header, so each request carries
+# ONLY the new user message.
+HERMES_API_BRAIN = "hermes-api"
+HERMES_API_URL = os.environ.get(
+    "HERMES_API_URL", "http://127.0.0.1:8642/v1/chat/completions")
+HERMES_API_TIMEOUT = float(os.environ.get("HERMES_API_TIMEOUT", "180"))
+
+# A separate file from SESSION_FILE on purpose: the CLI brain stores
+# `local-…`/timestamp ids the gateway does not own (it answers 409), so
+# switching brains must never hand one store's id to the other brain.
+API_SESSION_FILE = os.path.expanduser(
+    "~/.hermes_glasses_bridge_api_session.json")
+
+HERMES_API_UNAVAILABLE_TOO_SLOW = "Sorry, Hermes took too long to respond."
+HERMES_API_EMPTY = "Hermes didn't return a reply."
+
+
+def hermes_api_key() -> str:
+    """Read at call time so the value never sits in a module global."""
+    return os.environ.get("HERMES_API_KEY", "")
+
+
+def check_brain_config(brain: str) -> str | None:
+    """Startup check: an error message when the brain can't work, else None.
+
+    Never includes secret values.
+    """
+    if brain == HERMES_API_BRAIN and not hermes_api_key():
+        return ("HERMES_BRIDGE_BRAIN=hermes-api needs HERMES_API_KEY (the "
+                "Hermes gateway API bearer key). Set it in the bridge "
+                "environment and restart.")
+    return None
+
+
+def new_api_session_id() -> str:
+    """glasses-<YYYYMMDD>-<12 hex>: bridge-generated, so the very first turn
+    already carries a session header (without one the gateway derives an id
+    from the first message's text and merges unrelated conversations)."""
+    return "glasses-%s-%s" % (datetime.date.today().strftime("%Y%m%d"),
+                              uuid.uuid4().hex[:12])
+
+
+def load_api_session() -> str | None:
+    """Stored gateway session id, if it is from today (same rules as
+    load_session for the CLI brain)."""
+    try:
+        with open(API_SESSION_FILE) as f:
+            data = json.load(f)
+        if data.get("date") == _today() and data.get("session_id"):
+            return data["session_id"]
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def store_api_session(session_id: str):
+    try:
+        with open(API_SESSION_FILE, "w") as f:
+            json.dump({"session_id": session_id, "date": _today()}, f)
+    except OSError as e:
+        print(f"[Bridge] Could not persist API session: {e}")
+
+
+def clear_api_session():
+    try:
+        os.unlink(API_SESSION_FILE)
+    except OSError:
+        pass
+
+
+def build_hermes_api_request(
+    url: str, api_key: str, session_id: str, text: str,
+    photo: bytes | None = None,
+) -> tuple[str, dict, dict]:
+    """Return (url, headers, body) for one gateway chat turn."""
+    if photo:
+        content = [
+            {"type": "text", "text": text},
+            {"type": "image_url", "image_url": {
+                "url": "data:image/jpeg;base64,"
+                       + base64.b64encode(photo).decode()}},
+        ]
+    else:
+        content = text
+    headers = {
+        "Authorization": "Bearer " + api_key,
+        "Content-Type": "application/json",
+        "X-Hermes-Session-Id": session_id,
+    }
+    body = {"model": "hermes", "stream": False,
+            "messages": [{"role": "user", "content": content}]}
+    return url, headers, body
+
+
+def _redact(text: str, secret: str) -> str:
+    return text.replace(secret, "***") if secret else text
+
+
+def _hermes_api_error_message(body_bytes: bytes) -> str:
+    try:
+        data = json.loads(body_bytes.decode("utf-8", "replace"))
+        err = data.get("error") if isinstance(data, dict) else None
+        if isinstance(err, dict):
+            return str(err.get("message", ""))
+        if isinstance(err, str):
+            return err
+    except (ValueError, AttributeError):
+        pass
+    return body_bytes.decode("utf-8", "replace")
+
+
+def _post_hermes_api(api_key: str, session_id: str, text: str,
+                     photo: bytes | None) -> tuple[int | None, str]:
+    """One POST. Returns (status, reply_or_spoken_error).
+
+    status None = transport failure (timeout / refused); the second value
+    is then already the spoken message.
+    """
+    url, headers, body = build_hermes_api_request(
+        HERMES_API_URL, api_key, session_id, text, photo)
+    request = urllib.request.Request(
+        url, data=json.dumps(body).encode(), headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=HERMES_API_TIMEOUT) as resp:
+            status, body_bytes = resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        status, body_bytes = e.code, e.read()
+    except (TimeoutError, socket.timeout):
+        print(f"[Hermes API] Timed out after {HERMES_API_TIMEOUT:g}s")
+        return None, HERMES_API_UNAVAILABLE_TOO_SLOW
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, (TimeoutError, socket.timeout)):
+            print(f"[Hermes API] Timed out after {HERMES_API_TIMEOUT:g}s")
+            return None, HERMES_API_UNAVAILABLE_TOO_SLOW
+        print("[Hermes API] Connection error: "
+              + _redact(str(e.reason), api_key)[:200])
+        return None, "Hermes is unavailable right now."
+    except OSError as e:
+        print("[Hermes API] Connection error: " + _redact(str(e), api_key)[:200])
+        return None, "Hermes is unavailable right now."
+
+    if status != 200:
+        message = _redact(_hermes_api_error_message(body_bytes), api_key)
+        print(f"[Hermes API] HTTP {status}: {message[:200]}")
+        return status, f"Hermes is unavailable right now (HTTP {status})."
+    try:
+        data = json.loads(body_bytes.decode("utf-8"))
+        reply = data["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        print(f"[Hermes API] Unparseable reply: {type(e).__name__}")
+        return 200, HERMES_API_EMPTY
+    if not isinstance(reply, str) or not reply.strip():
+        return 200, HERMES_API_EMPTY
+    return 200, reply.strip()
+
+
+def ask_hermes_api(
+    text: str,
+    photo: bytes | None,
+    session_id: str,
+    new_session: bool,
+) -> tuple[str, str | None]:
+    """Ask the Hermes gateway API. Returns (reply_text, session_to_store).
+
+    `text` is the query without persona; the voice persona is prefixed when
+    `new_session` (same rule as the CLI brain). On HTTP 409 (session busy /
+    owned elsewhere) retries ONCE with a fresh session id. session_to_store
+    is the id to persist (None when nothing should be stored). The reply is
+    always speakable text and never contains the key.
+    """
+    api_key = hermes_api_key()
+    if not api_key:
+        return ("The Hermes API brain needs HERMES_API_KEY. Set it for "
+                "the bridge."), None
+
+    query = (VOICE_PERSONA + text) if new_session else text
+    status, reply = _post_hermes_api(api_key, session_id, query, photo)
+    if status == 409:
+        session_id = new_api_session_id()
+        print(f"[Bridge] Hermes API session busy (409) - retrying with a "
+              f"fresh session ({session_id})")
+        status, reply = _post_hermes_api(
+            api_key, session_id, VOICE_PERSONA + text, photo)
+    if status == 200:
+        return reply, session_id
+    return reply, None
+
+
 # ── Text-to-Speech ─────────────────────────────────────────────────────────
 
 def synthesize_speech(text: str) -> bytes | None:
@@ -668,10 +861,22 @@ async def process_query(websocket, text: str, conn_state: dict | None = None,
                           + text)
 
     canon_brain = _canon_brain(BRAIN)
+    started = time.monotonic()
     if canon_brain in ("anthropic", "openai", "gemini"):
         # ── Ask the provider API directly (fast path) ──
         print(f"[Bridge] Asking {canon_brain} ({CLAUDE_MODEL})...")
         response = await asyncio.to_thread(ask_provider, canon_brain, query_text, photo)
+    elif canon_brain == HERMES_API_BRAIN:
+        # ── Ask the always-running Hermes gateway (no CLI boot) ──
+        session_id = load_api_session()
+        new_session = session_id is None
+        if new_session:
+            session_id = new_api_session_id()
+        print(f"[Bridge] Asking Hermes API... (session: {session_id})")
+        response, stored_id = await asyncio.to_thread(
+            ask_hermes_api, query_text, photo, session_id, new_session)
+        if stored_id:
+            store_api_session(stored_id)
     else:
         # ── Ask Hermes (with same-day conversation memory) ──
         image_path = None
@@ -703,7 +908,11 @@ async def process_query(websocket, text: str, conn_state: dict | None = None,
                 os.unlink(image_path)
     response_text = response or "I'm not sure what to say."
 
-    print(f"[Bridge] Hermes: {response_text[:100]}...")
+    if canon_brain in ("anthropic", "openai", "gemini"):
+        print(f"[Bridge] Hermes: {response_text[:100]}...")
+    else:
+        elapsed = time.monotonic() - started
+        print(f"[Bridge] Hermes ({elapsed:.1f}s): {response_text[:100]}...")
 
     # "tts": whether PCM audio follows. False → the app speaks the text
     # itself with on-device synthesis.
@@ -790,6 +999,7 @@ async def handle_connection(websocket):
             elif msg_type == "new_session":
                 # Forget the conversation; next query starts fresh
                 clear_session()
+                clear_api_session()
                 clear_claude_history()
                 conn_state["last_photo_at"] = 0.0
                 print("[Bridge] Conversation reset by app")
@@ -821,7 +1031,20 @@ def local_ip() -> str:
         return "<your-mac-ip>"
 
 
+def brain_label() -> str:
+    canon = _canon_brain(BRAIN)
+    if canon in ("anthropic", "openai", "gemini"):
+        return f"({CLAUDE_MODEL})"
+    if canon == HERMES_API_BRAIN:
+        return "(gateway API)"
+    return "(CLI agent)"
+
+
 async def main():
+    config_error = check_brain_config(_canon_brain(BRAIN))
+    if config_error:
+        print(f"[Bridge] FATAL: {config_error}")
+        sys.exit(1)
     if not AUTH_TOKEN:
         print(f"""
 !!! WARNING: no HERMES_BRIDGE_TOKEN set - this bridge is UNAUTHENTICATED.
@@ -836,7 +1059,7 @@ async def main():
 ║                                                          ║
 ║  Listening on ws://{HOST}:{PORT}/voice                       ║
 ║  STT: on the phone - the app sends text queries          ║
-║  Brain: {BRAIN} {f"({CLAUDE_MODEL})" if _canon_brain(BRAIN) in ("anthropic", "openai", "gemini") else "(CLI agent)":<30}  ║
+║  Brain: {BRAIN} {brain_label():<30}  ║
 ║                                                          ║
 ║  Connect your glasses app to:                            ║
 ║  ws://{local_ip()}:{PORT}/voice                             ║
