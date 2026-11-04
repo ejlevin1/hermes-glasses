@@ -547,10 +547,15 @@ def check_brain_config(brain: str) -> str | None:
 
     Never includes secret values.
     """
-    if brain == HERMES_API_BRAIN and not hermes_api_key():
+    if brain != HERMES_API_BRAIN:
+        return None
+    if not hermes_api_key():
         return ("HERMES_BRIDGE_BRAIN=hermes-api needs HERMES_API_KEY (the "
                 "Hermes gateway API bearer key). Set it in the bridge "
                 "environment and restart.")
+    if not HERMES_API_URL.lower().startswith(("http://", "https://")):
+        return ("HERMES_API_URL must start with http:// or https:// "
+                "(e.g. http://127.0.0.1:8642/v1/chat/completions).")
     return None
 
 
@@ -631,19 +636,36 @@ def _hermes_api_error_message(body_bytes: bytes) -> str:
     return body_bytes.decode("utf-8", "replace")
 
 
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """A 3xx is an error, never followed: following one would re-send the
+    Bearer key to wherever the Location header points."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # urllib then raises HTTPError(code) for the 3xx
+
+
+# No proxies (an env HTTP(S)_PROXY must never see the Bearer key or the
+# conversation) and no redirects.
+_HERMES_API_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _RefuseRedirects())
+
+
 def _post_hermes_api(api_key: str, session_id: str, text: str,
                      photo: bytes | None) -> tuple[int | None, str]:
     """One POST. Returns (status, reply_or_spoken_error).
 
-    status None = transport failure (timeout / refused); the second value
-    is then already the spoken message.
+    status None = transport failure (timeout / refused / anything else
+    unexpected); the second value is then already the spoken message.
+    Never raises.
     """
-    url, headers, body = build_hermes_api_request(
-        HERMES_API_URL, api_key, session_id, text, photo)
-    request = urllib.request.Request(
-        url, data=json.dumps(body).encode(), headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=HERMES_API_TIMEOUT) as resp:
+        url, headers, body = build_hermes_api_request(
+            HERMES_API_URL, api_key, session_id, text, photo)
+        request = urllib.request.Request(
+            url, data=json.dumps(body).encode(), headers=headers,
+            method="POST")
+        with _HERMES_API_OPENER.open(request,
+                                     timeout=HERMES_API_TIMEOUT) as resp:
             status, body_bytes = resp.status, resp.read()
     except urllib.error.HTTPError as e:
         status, body_bytes = e.code, e.read()
@@ -659,6 +681,10 @@ def _post_hermes_api(api_key: str, session_id: str, text: str,
         return None, "Hermes is unavailable right now."
     except OSError as e:
         print("[Hermes API] Connection error: " + _redact(str(e), api_key)[:200])
+        return None, "Hermes is unavailable right now."
+    except Exception as e:  # malformed URL, IncompleteRead, ... - never crash
+        print(f"[Hermes API] {type(e).__name__}: "
+              + _redact(str(e), api_key)[:200])
         return None, "Hermes is unavailable right now."
 
     if status != 200:
@@ -703,6 +729,10 @@ def ask_hermes_api(
               f"fresh session ({session_id})")
         status, reply = _post_hermes_api(
             api_key, session_id, VOICE_PERSONA + text, photo)
+        if status == 409:
+            # Still busy with a brand-new id: forget the stored one so the
+            # next turn starts clean instead of hitting the same 409.
+            clear_api_session()
     if status == 200:
         return reply, session_id
     return reply, None

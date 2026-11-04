@@ -467,6 +467,7 @@ import json
 import re
 import threading
 import time
+import urllib.request
 
 FAKE_KEY = "sk-test-SECRET-key-0123456789"
 
@@ -474,7 +475,7 @@ FAKE_KEY = "sk-test-SECRET-key-0123456789"
 class FakeGateway:
     """Local OpenAI-compatible fake on 127.0.0.1:<free port>.
 
-    `responses` is a queue of (status, body_dict, delay_s); the last entry
+    `responses` is a queue of (status, body_dict, delay_s[, headers]); the last entry
     repeats once the queue is drained. Every request is recorded.
     """
 
@@ -493,15 +494,19 @@ class FakeGateway:
                     "body": json.loads(raw.decode()),
                 })
                 if len(gateway.responses) > 1:
-                    status, body, delay = gateway.responses.pop(0)
+                    entry = gateway.responses.pop(0)
                 else:
-                    status, body, delay = gateway.responses[0]
+                    entry = gateway.responses[0]
+                status, body, delay = entry[:3]
+                extra_headers = entry[3] if len(entry) > 3 else {}
                 if delay:
                     time.sleep(delay)
                 payload = json.dumps(body).encode()
                 try:
                     self.send_response(status)
                     self.send_header("Content-Type", "application/json")
+                    for name, value in extra_headers.items():
+                        self.send_header(name, value)
                     self.send_header("Content-Length", str(len(payload)))
                     self.end_headers()
                     self.wfile.write(payload)
@@ -525,6 +530,36 @@ class FakeGateway:
     def close(self):
         self.server.shutdown()
         self.server.server_close()
+
+
+class QuerySocket(FakeWebSocket):
+    """Drives handle_connection: yields each queued message, then closes."""
+    remote_address = ("127.0.0.1", 1)
+    request = None
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._messages:
+            raise StopAsyncIteration
+        return self._messages.pop(0)
+
+
+class _FakeResponse:
+    def __init__(self, status=200, body=b"", read_error=None):
+        self.status, self._body, self._read_error = status, body, read_error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        if self._read_error:
+            raise self._read_error
+        return self._body
 
 
 def ok_reply(text):
@@ -716,19 +751,7 @@ class HermesApiBrainTests(unittest.TestCase):
         gw = self.gateway([ok_reply("One."), ok_reply("Two.")])
         self.ask("first")
 
-        class ResetSocket(FakeWebSocket):
-            remote_address = ("127.0.0.1", 1)
-            request = None
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                if not self._messages:
-                    raise StopAsyncIteration
-                return self._messages.pop(0)
-
-        ws = ResetSocket(['{"type":"new_session"}'])
+        ws = QuerySocket(['{"type":"new_session"}'])
         with contextlib.redirect_stdout(self.log):
             asyncio.run(hb.handle_connection(ws))
         self.assertIsNone(hb.load_api_session())
@@ -757,6 +780,98 @@ class HermesApiBrainTests(unittest.TestCase):
             self.assertTrue(
                 r["headers"]["x-hermes-session-id"].startswith("glasses-"))
         self.assertNotEqual(hb.SESSION_FILE, hb.API_SESSION_FILE)
+
+    # ── fix round: R1 (never raise), R2 (no redirects / proxies), R3 ──
+    def test_malformed_url_returns_friendly_text(self):
+        for bad in ("not a url", "ftp//127.0.0.1/x", "http://[::1"):
+            hb.HERMES_API_URL = bad
+            reply = self.ask("hello")
+            self.assertEqual(reply["text"], "Hermes is unavailable right now.")
+        self.assertKeyNowhere(json.dumps(reply))
+        self.assertIsNone(hb.load_api_session())
+
+    def test_incomplete_read_returns_friendly_text(self):
+        import http.client
+        err = http.client.IncompleteRead(b"partial " + FAKE_KEY.encode(), 99)
+        with unittest.mock.patch.object(
+                hb._HERMES_API_OPENER, "open",
+                return_value=_FakeResponse(read_error=err)):
+            reply = self.ask("hello")
+        self.assertEqual(reply["text"], "Hermes is unavailable right now.")
+        self.assertIn("[Hermes API] IncompleteRead", self.log.getvalue())
+        self.assertKeyNowhere(json.dumps(reply))
+
+    def test_ws_loop_keeps_running_after_unexpected_error(self):
+        import http.client
+        ok = json.dumps({"choices": [{"message": {"content": "Second."}}]})
+        with unittest.mock.patch.object(
+                hb._HERMES_API_OPENER, "open", side_effect=[
+                    _FakeResponse(read_error=http.client.IncompleteRead(b"", 5)),
+                    _FakeResponse(body=ok.encode())]):
+            ws = QuerySocket(['{"type":"query","text":"first"}',
+                              '{"type":"query","text":"second"}'])
+            with contextlib.redirect_stdout(self.log):
+                asyncio.run(hb.handle_connection(ws))
+        texts = [json.loads(m).get("text") for m in ws.sent
+                 if isinstance(m, str) and json.loads(m).get("type") == "response"]
+        self.assertEqual(texts, ["Hermes is unavailable right now.", "Second."])
+
+    def test_check_brain_config_rejects_non_http_url(self):
+        for bad in ("127.0.0.1:8642/v1/chat/completions", "ftp://x/y", ""):
+            hb.HERMES_API_URL = bad
+            self.assertIn("HERMES_API_URL", hb.check_brain_config("hermes-api"))
+        for good in ("http://127.0.0.1:8642/v1/chat/completions",
+                     "https://gw.example/p/hostbot/v1/chat/completions"):
+            hb.HERMES_API_URL = good
+            self.assertIsNone(hb.check_brain_config("hermes-api"))
+        hb.HERMES_API_URL = "ftp://x/y"
+        self.assertIsNone(hb.check_brain_config("hermes"))
+
+    def test_main_exits_on_bad_url(self):
+        hb.HERMES_API_URL = "127.0.0.1:8642/v1/chat/completions"
+        with contextlib.redirect_stdout(self.log):
+            with self.assertRaises(SystemExit):
+                asyncio.run(hb.main())
+        self.assertIn("FATAL: HERMES_API_URL", self.log.getvalue())
+        self.assertKeyNowhere()
+
+    def test_redirect_is_refused_and_key_not_resent(self):
+        target = FakeGateway([ok_reply("should never be asked")])
+        self.addCleanup(target.close)
+        self.gateway([(302, {}, 0, {"Location": target.url})])
+        reply = self.ask("hello")
+        self.assertEqual(reply["text"],
+                         "Hermes is unavailable right now (HTTP 302).")
+        self.assertEqual(target.requests, [])
+        self.assertIsNone(hb.load_api_session())
+        self.assertKeyNowhere(json.dumps(reply))
+
+    def test_opener_ignores_proxy_environment(self):
+        proxy = FakeGateway([ok_reply("via proxy")])
+        self.addCleanup(proxy.close)
+        gw = self.gateway([ok_reply("Direct.")])
+        env = {k: "" for k in ("no_proxy", "NO_PROXY")}
+        env.update({"http_proxy": "http://127.0.0.1:%d" % proxy.port,
+                    "HTTP_PROXY": "http://127.0.0.1:%d" % proxy.port})
+        with unittest.mock.patch.dict(os.environ, env):
+            reply = self.ask("hello")
+        self.assertEqual(reply["text"], "Direct.")
+        self.assertEqual(proxy.requests, [])
+        self.assertEqual(len(gw.requests), 1)
+
+    def test_409_twice_clears_stored_session(self):
+        hb.store_api_session("glasses-20260101-aaaaaaaaaaaa")
+        gw = self.gateway([(409, {"error": {"message": "busy"}}, 0)])
+        self.ask("hello")
+        self.assertEqual(len(gw.requests), 2)
+        self.assertIsNone(hb.load_api_session())
+        # Next turn starts a fresh session (persona again), not the stale id
+        gw.responses = [ok_reply("Back.")]
+        self.ask("again")
+        third = gw.requests[2]
+        self.assertNotEqual(third["headers"]["x-hermes-session-id"],
+                            "glasses-20260101-aaaaaaaaaaaa")
+        self.assertIn("voice assistant", third["body"]["messages"][0]["content"])
 
     def test_session_id_format(self):
         sid = hb.new_api_session_id()
