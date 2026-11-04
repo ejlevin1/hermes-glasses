@@ -1,0 +1,23 @@
+# The same certificate repository Tool Approvals and AgentApi use, so all of
+# Eric's signing material lives in one place.
+#
+# me.ericlevin.hermesglasses is NEW to this repository. Adding it needs ONE
+# readonly:false run of the `certs` lane (MATCH_READONLY=0), which must REUSE
+# the certificates already in the repo -- distribution ZBZU9783S4 and
+# development 76B22RR6W7 -- and only create the profiles. Read
+# ~/Development/hermes-tool-approvals/ios/docs/BUILD_MACHINE.md first: a
+# readonly:false run against a type whose certificate is missing from the repo
+# MINTS a new certificate, and on mbp-m2 (no global git identity) the push then
+# fails as a mere warning, orphaning it. The `certs` lane sets
+# MATCH_GIT_FULL_NAME / MATCH_GIT_USER_EMAIL against exactly that. Never
+# `match nuke`, never touch the me.ericlevin.approvals* profiles.
+git_url("https://github.com/ejlevin1/aapi-match-certs")
+storage_mode("git")
+
+type("appstore")
+app_identifier(["me.ericlevin.hermesglasses"])
+team_id("6MPMD6S5U9")
+
+# MATCH_PASSWORD (the repository's encryption passphrase) and
+# MATCH_GIT_BASIC_AUTHORIZATION come from the environment, fastlane/.env.local
+# or mbp-m2's ~/Development/.env/approvals-fastlane -- never from this file.
