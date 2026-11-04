@@ -11,8 +11,8 @@
 #   MATCH_KEYCHAIN_NAME / MATCH_KEYCHAIN_PASSWORD
 #                                               the dedicated codesigning keychain
 #                                               a headless session on mbp-m2 needs
-#   ASC_APP_ID (optional)                       numeric Apple ID of the ASC app
-#                                               record, once it exists
+#   ASC_APP_ID (optional)                       overrides APPLE_ID (the ASC app
+#                                               record's numeric Apple ID)
 #
 # Three places are read, in order of precedence, and the first one that has a
 # given name wins:
@@ -43,14 +43,14 @@ APPSTORE_PROFILE = "match AppStore #{APP_IDENTIFIER}"
 DEVELOPMENT_PROFILE = "match Development #{APP_IDENTIFIER}"
 IPA_NAME = "HermesGlasses.ipa"
 
-# The ASC app record's numeric Apple ID. Not known yet (Eric creates the record
-# by hand -- the ASC API cannot create apps), so it is read from the
-# environment until it can become a constant like Tool Approvals' APPLE_ID.
-# Without it the lanes look the app up by bundle id, which works but is an
-# extra round trip.
+# The ASC app record's numeric Apple ID (App Store Connect > App Information >
+# Apple ID), a constant like Tool Approvals' APPLE_ID. ASC_APP_ID in the
+# environment still overrides it.
+APPLE_ID = "6830498208"
+
 def asc_app_id
   value = ENV["ASC_APP_ID"]
-  value.nil? || value.strip.empty? ? nil : value.strip
+  value.nil? || value.strip.empty? ? APPLE_ID : value.strip
 end
 
 MACHINE_SECRET_FILES = [
