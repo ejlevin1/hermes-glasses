@@ -1,6 +1,8 @@
 //
 // Standalone tests for DeviceContextFormatter - run via swiftc
-// (no XCTest target in this project).
+// (no XCTest target in this project):
+//   xcrun swiftc HermesGlasses/Services/DeviceContextFormatter.swift \
+//     tests/device-context/main.swift -o /tmp/device-context-tests && /tmp/device-context-tests
 //
 
 import Foundation
