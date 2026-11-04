@@ -120,3 +120,57 @@ OK
 
 - Stream (`stream: true`) and speak the first sentence early, to cut
   perceived latency further.
+
+## Fix round (review R1-R3)
+
+Changed: `bridge/hermes_bridge.py`, `bridge/test_hermes_bridge.py`,
+`bridge/.env.example` (one note on the URL).
+
+- **R1** `_post_hermes_api` now builds the `Request` inside the `try` and ends
+  with `except Exception`. That handler returns "Hermes is unavailable right
+  now." and logs only `<ExceptionType>: <message>`, with the key redacted and
+  the message cut to 200 chars. The function never raises, so a malformed
+  URL or an `http.client.IncompleteRead` can no longer kill the turn.
+  `check_brain_config` also returns a FATAL error when `HERMES_API_URL` does
+  not start with `http://` or `https://`, and `main()` exits on it.
+- **R2** Requests go through a module opener,
+  `build_opener(ProxyHandler({}), _RefuseRedirects())`. Proxy env vars are
+  ignored. A 3xx is never followed: urllib raises `HTTPError(3xx)`, which
+  takes the normal non-200 path, so the app hears "Hermes is unavailable
+  right now (HTTP 302)." and the Bearer key is never re-sent.
+- **R3** When the retry also gets 409, `clear_api_session()` runs. The next
+  turn starts a fresh session (with the persona) instead of reusing the stale
+  id. This resolves the open item above about a second 409.
+
+New tests in `HermesApiBrainTests` (8):
+- `test_malformed_url_returns_friendly_text`: three bad URLs
+- `test_incomplete_read_returns_friendly_text`
+- `test_ws_loop_keeps_running_after_unexpected_error`: two queries through
+  `handle_connection`. The first hits IncompleteRead and the second still
+  gets its answer.
+- `test_check_brain_config_rejects_non_http_url`
+- `test_main_exits_on_bad_url`
+- `test_redirect_is_refused_and_key_not_resent`: the fake answers 302 to a
+  second fake on another port, and the second fake receives zero requests.
+- `test_opener_ignores_proxy_environment`: `http_proxy` points at a third
+  fake, which receives zero requests, and the request goes direct.
+- `test_409_twice_clears_stored_session`
+
+`FakeGateway` entries may now carry a 4th element, extra response headers
+(used for `Location`). `QuerySocket` is a shared helper, replacing the inline
+`ResetSocket`.
+
+Mutation check: I ran each of the 8 new tests against the pre-fix
+`hermes_bridge.py` in a temporary copy. All 8 failed. Seven errored or
+failed outright. `test_main_exits_on_bad_url` hung, because the old `main()`
+starts serving, and a 20 s alarm killed it.
+
+Full bridge suite, after the fix:
+
+```
+cd bridge && /tmp/gl-gateway-venv/bin/python -m unittest test_hermes_bridge -v
+Ran 63 tests in 8.899s
+OK
+```
+
+(55 before + 8 new.)
