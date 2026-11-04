@@ -145,3 +145,58 @@ Keychain field names + OSStatus; no `print` in app code touches credentials.
 - Bridge test reachability probe runs on Settings dismiss and at launch against the default
   `wss://glasses.ericlevin.me/voice` for new installs — without the CF token saved it will show "unreachable"
   (403) until the Bridge access fields are filled. Expected; the failure text says so.
+
+---
+
+## Fix round 1 (lane gl-fix-1, review gl-review)
+
+Code commits: `f95cfbf` (F1 + F2), `e7abb00` (F3). Status above stays `READY-FOR-LIVE`.
+
+### F1 (major, security) — bridge secrets bound to a host
+- `HermesGlasses/Services/BridgeRequestBuilder.swift`: `BridgeCredentials.boundHost` (non-secret).
+  `request(endpoint:credentials:)` attaches the `CF-Access-*` headers and the Keychain `?token=` only when
+  `secretsAllowed(for:boundHost:)` — `url.host` equals the bound host (case-insensitive) **and** scheme is `wss`.
+  Otherwise it returns exactly `URLRequest(url:)` of the endpoint as typed, so a `?token=` the user typed into the
+  URL is kept untouched; empty credentials also give exactly `URLRequest(url:)`. Helpers `host(of:)` and
+  `migratedBoundHost(currentEndpoint:)` (pure).
+- `HermesGlasses/Services/BridgeCredentialStore.swift`: bound host in UserDefaults `bridge_credentials_host`;
+  `bind(toEndpoint:)` on every save, `unbindIfEmpty()` when the last secret is removed;
+  `migrateBoundHostIfNeeded(currentEndpoint:)` runs once (marker `bridge_credentials_host_migrated`): existing
+  secrets with no bound host are bound to the current endpoint's host only if it is `wss://`, else left unbound
+  (sent nowhere) until re-saved. The marker stops it re-binding later to whatever endpoint is current.
+- `HermesGlasses/ViewModels/HermesSessionViewModel.swift`: `setBridgeCredential(_:for:boundTo:)` binds to the
+  endpoint the value was typed for (the Settings field, which is committed after the credentials);
+  `bridgeCredentialHost` for the UI; migration runs in `reloadBridgeCredentialState()` and `makeAPIClient()`.
+  Session, launch probe (`checkBridge`) and the Developer "Bridge" test all still go through `makeAPIClient()`.
+- `HermesGlasses/Views/SettingsView.swift`: Bridge access footer names the bound host ("Saved secrets are sent only
+  to <host>, over wss://."), or says they are sent nowhere / will apply to the endpoint above. No secret values.
+- Behaviour note: saving any one secret re-binds all three to the endpoint in the field (one shared host).
+  Switching to another host without re-saving sends nothing there — the footer says so.
+
+### F2 — Logger subsystem
+`BridgeCredentialStore` (new file) logs under `me.ericlevin.hermesglasses`. **Exception kept on purpose:** the
+pre-existing upstream `Logger` subsystems / queue labels (`com.flowsxr…`) are unchanged.
+
+### F3 — no redirects on the bridge socket
+`HermesAPIClient.connect()` creates its `URLSession` with `BridgeNoRedirectDelegate` (a separate
+`URLSessionTaskDelegate`, so the session doesn't retain the client), whose `willPerformHTTPRedirection` calls
+`completionHandler(nil)`.
+
+### Tests (fix round 1)
+| Command | Result |
+|---|---|
+| `swiftc HermesGlasses/Services/BridgeRequestBuilder.swift tests/bridge-request/main.swift -o /tmp/… && /tmp/…` | **83 PASS, ALL PASS** (new: different host, host-as-prefix, host-as-userinfo, same host `ws://`, same host `https://`, same host `wss://`, upper-case endpoint, upper-case bound host, explicit port, bound host unset/blank, user-typed token kept (other host / bound host / no creds), empty creds == `URLRequest(url:)`, migration helpers) |
+| `scripts/run_swift_tests.sh` (`build/fix1-swift-tests.log`) | **38 passed, 0 failed (of 38 suites)** |
+| `cd bridge && .venv/bin/python -m unittest test_hermes_bridge -v` (`build/fix1-bridge-tests.log`) | **Ran 39 tests, OK** |
+| `bundle exec fastlane test` (Homebrew Ruby on PATH; system Ruby 2.6 lacks bundler 4) (`build/fix1-fastlane-test.log`) | sim BUILD SUCCEEDED, 38/38 suites, `fastlane.tools finished successfully` |
+| `xcodebuild -project HermesGlasses.xcodeproj -scheme HermesGlasses -configuration Debug -destination generic/platform=iOS -derivedDataPath build/DerivedData -skipPackagePluginValidation -skipMacroValidation CODE_SIGNING_ALLOWED=NO build` (`build/fix1-device-build.log`) | **BUILD SUCCEEDED** (no new warnings in touched code) |
+
+Secret scan of `git diff origin/ios/cf-access-fastlane` before commit: no tokens, keys or long random strings
+(only UserDefaults key names and test placeholders `tok`/`sec`/`s3cret`).
+
+Out of scope, untouched: F4 (signing, s3), F6 (`CFBundleShortVersionString` 1.0), fastlane/bridge/identity code.
+
+Open items: none new. Device check worth doing in live phase: Settings → Assistant shows the bound host in the
+Bridge access footer after the secrets are pasted with `wss://glasses.ericlevin.me/voice` in the endpoint field.
+
+HEAD after code fixes: `e7abb00` (this report commit follows it).
