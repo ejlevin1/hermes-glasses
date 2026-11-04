@@ -24,7 +24,7 @@ Secrets, none of them in git:
 | Meta DAT app id + client token | `~/Development/.env/hermes-glasses-secrets.xcconfig` (or `$HERMES_GLASSES_SECRETS`), copied to `Config/Secrets.xcconfig` by `scripts/write_secrets.sh` | build |
 | ASC API key, match passphrase, certs-repo token | `~/Development/.env/approvals-fastlane` | `certs`, `beta` |
 | signing keychain name + password | `~/Development/.env/approvals-keychain` | `certs`, `beta` |
-| ASC app record id (optional) | env `ASC_APP_ID` or `fastlane/.env.local` | `beta` upload |
+| ASC app record id | `APPLE_ID` constant in `fastlane/Fastfile` (6830498208); env `ASC_APP_ID` overrides | `beta` upload |
 
 The Fastfile reads those files itself (environment first, then `fastlane/.env.local`, then the machine
 files), so no `set -a; . …` preamble is needed. Only variable *names* are ever logged.
