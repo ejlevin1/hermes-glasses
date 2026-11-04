@@ -18,8 +18,19 @@ Config/Secrets.xcconfig
 
 # Python
 bridge/__pycache__/
+bridge/.venv/
 *.pyc
 nohup.out
+
+# Ruby / fastlane
+vendor/bundle/
+fastlane/.env.local
+fastlane/report.xml
+fastlane/test_output/
+*.p8
+*.mobileprovision
+*.ipa
+*.app.dSYM.zip
 
 # Superpowers scratch (personal paths / device UDIDs - keep local only)
 .superpowers/
