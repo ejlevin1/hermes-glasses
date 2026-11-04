@@ -12,7 +12,8 @@
 // (5d), which now owns the subsystem test panel that used to float over
 // the session screen.
 //
-// Text the user types (bridge endpoint, API key) is owned HERE and passed
+// Text the user types (bridge endpoint, API key, bridge token, Cloudflare
+// Access service token) is owned HERE and passed
 // down by binding, so the existing "swipe-dismiss must not discard typed
 // values" contract still holds no matter which sub-page is open.
 //
@@ -35,6 +36,12 @@ struct SettingsView: View {
 
     @State private var endpoint: String = ""
     @State private var providerKey: String = ""
+    /// Bridge secrets being typed. The two secrets start empty (a
+    /// SecureField is never pre-filled with what the Keychain holds); the
+    /// client ID is seeded once with the saved value, like `endpoint`.
+    @State private var bridgeToken: String = ""
+    @State private var accessClientID: String = ""
+    @State private var accessClientSecret: String = ""
     @State private var showObjectLog: Bool = false
     /// Held as state rather than built per render: the store reads its index
     /// off disk on init, and the roster row asks for `count` every redraw.
@@ -78,7 +85,10 @@ struct SettingsView: View {
                         AssistantPage(
                             hermesVM: hermesVM,
                             endpoint: $endpoint,
-                            providerKey: $providerKey
+                            providerKey: $providerKey,
+                            bridgeToken: $bridgeToken,
+                            accessClientID: $accessClientID,
+                            accessClientSecret: $accessClientSecret
                         )
                     }
                     HermesDivider()
@@ -184,6 +194,8 @@ struct SettingsView: View {
                 if !didLoadEndpoint {
                     didLoadEndpoint = true
                     endpoint = hermesVM.hermesEndpoint
+                    hermesVM.reloadBridgeCredentialState()
+                    accessClientID = hermesVM.bridgeAccessClientID
                 }
                 if !didConsumeInitialRoute, let initialRoute {
                     didConsumeInitialRoute = true
@@ -275,6 +287,15 @@ struct SettingsView: View {
 
     /// Swipe-dismiss must not silently discard typed values.
     private func commitTypedValues() {
+        // Credentials before the endpoint: setEndpoint kicks off a
+        // reachability probe, which should already carry the new values.
+        hermesVM.setBridgeCredential(bridgeToken, for: .token)
+        bridgeToken = ""
+        hermesVM.setBridgeCredential(accessClientSecret, for: .accessClientSecret)
+        accessClientSecret = ""
+        if didLoadEndpoint {
+            hermesVM.setBridgeCredential(accessClientID, for: .accessClientID)
+        }
         hermesVM.setEndpoint(endpoint)
         if !providerKey.trimmingCharacters(in: .whitespaces).isEmpty {
             hermesVM.setProviderKey(providerKey)
@@ -790,6 +811,9 @@ private struct AssistantPage: View {
     let hermesVM: HermesSessionViewModel
     @Binding var endpoint: String
     @Binding var providerKey: String
+    @Binding var bridgeToken: String
+    @Binding var accessClientID: String
+    @Binding var accessClientSecret: String
 
     @State private var showSavePreset: Bool = false
     @State private var presetName: String = ""
@@ -1007,10 +1031,14 @@ private struct AssistantPage: View {
             .id(presetsVersion)
 
             fieldRow(title: "WebSocket URL") {
-                TextField("ws://…", text: $endpoint)
+                TextField("wss://…", text: $endpoint)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
-                    .font(.system(size: 15, design: .monospaced))
+                    .keyboardType(.URL)
+                    .textContentType(.URL)
+                    .font(.body.monospaced())
+                    .accessibilityLabel("Bridge WebSocket URL")
+                    .accessibilityHint("The address of your Hermes bridge, for example wss://host/voice.")
             }
 
             HermesDivider()
@@ -1030,6 +1058,86 @@ private struct AssistantPage: View {
             .buttonStyle(.plain)
             .disabled(endpoint.trimmingCharacters(in: .whitespaces).isEmpty)
         }
+
+        bridgeAccessSection
+    }
+
+    // MARK: Bridge access (token + Cloudflare Access)
+
+    /// The two locks in front of a remote bridge. All optional: leave them
+    /// empty for a bridge on your own network.
+    @ViewBuilder
+    private var bridgeAccessSection: some View {
+        HermesSection(
+            header: "Bridge access",
+            footer: "Needed only for a bridge reached over the internet. The token is sent to the bridge; the Cloudflare Access ID and secret are sent as headers, and only when both are set. All three are kept in this iPhone's Keychain. Leave a secret field empty to keep the saved value."
+        ) {
+            secretFieldRow(
+                title: "Bridge token",
+                text: $bridgeToken,
+                isSaved: hermesVM.hasBridgeToken,
+                hint: "The bridge's HERMES_BRIDGE_TOKEN. Leave empty to keep the saved token.",
+                clear: { hermesVM.clearBridgeCredential(.token) }
+            )
+
+            HermesDivider()
+
+            fieldRow(title: "Cloudflare Access Client ID") {
+                TextField("xxxx.access", text: $accessClientID)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .textContentType(.username)
+                    .font(.body.monospaced())
+                    .accessibilityLabel("Cloudflare Access Client ID")
+                    .accessibilityHint("The Client ID of the Cloudflare Access service token. Clear the field to remove it.")
+            }
+
+            HermesDivider()
+
+            secretFieldRow(
+                title: "Cloudflare Access Client Secret",
+                text: $accessClientSecret,
+                isSaved: hermesVM.hasBridgeAccessSecret,
+                hint: "The Client Secret of the Cloudflare Access service token. Leave empty to keep the saved secret.",
+                clear: { hermesVM.clearBridgeCredential(.accessClientSecret) }
+            )
+        }
+    }
+
+    /// A SecureField that never shows what is stored, with a status line
+    /// saying whether something is saved and a Remove button when it is.
+    private func secretFieldRow(
+        title: String,
+        text: Binding<String>,
+        isSaved: Bool,
+        hint: String,
+        clear: @escaping () -> Void
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            fieldRow(title: title) {
+                SecureField(isSaved ? "Saved - type to replace" : "Not set", text: text)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .textContentType(.password)
+                    .font(.body.monospaced())
+                    .accessibilityLabel(title)
+                    .accessibilityValue(isSaved ? "Saved in Keychain" : "Not set")
+                    .accessibilityHint(hint)
+            }
+            if isSaved {
+                Button(role: .destructive) {
+                    text.wrappedValue = ""
+                    clear()
+                } label: {
+                    Label("Remove saved \(title.lowercased())", systemImage: "trash")
+                        .font(.subheadline)
+                }
+                .buttonStyle(.borderless)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 10)
+                .frame(minHeight: 44)
+            }
+        }
     }
 
     /// Label over an editable field, inside a card row.
@@ -1038,8 +1146,10 @@ private struct AssistantPage: View {
         @ViewBuilder field: () -> Field
     ) -> some View {
         VStack(alignment: .leading, spacing: 4) {
+            // .footnote (13 pt at the default size) rather than a fixed
+            // size, so the label grows with Dynamic Type like its field.
             Text(title)
-                .font(.system(size: 13))
+                .font(.footnote)
                 .foregroundStyle(.secondary)
             field()
         }

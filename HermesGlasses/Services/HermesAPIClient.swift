@@ -30,6 +30,10 @@ final class HermesAPIClient: NSObject {
     // MARK: - Private
 
     private let endpoint: String
+    /// Bridge token + Cloudflare Access service token. Only ever put into
+    /// the request (query item / headers) by `BridgeRequestBuilder`; never
+    /// logged, never included in an error message.
+    private let credentials: BridgeCredentials
     private var webSocket: URLSessionWebSocketTask?
     private var session: URLSession?
     /// Behind a lock because the receive loop clears it from a background
@@ -44,8 +48,9 @@ final class HermesAPIClient: NSObject {
     /// TTS audio accumulated between audio_start and audio_end
     private var ttsBuffer = Data()
 
-    init(endpoint: String) {
+    init(endpoint: String, credentials: BridgeCredentials = .empty) {
         self.endpoint = endpoint
+        self.credentials = credentials
         super.init()
     }
 
@@ -55,7 +60,12 @@ final class HermesAPIClient: NSObject {
     /// Returns true once the bridge has confirmed the connection.
     @discardableResult
     func connect() async -> Bool {
-        guard let url = URL(string: endpoint) else {
+        // A URLRequest, not a bare URL: the Cloudflare Access headers can
+        // only travel on a request. The message names the endpoint as
+        // typed, never the built URL - that one carries the bridge token.
+        guard let request = BridgeRequestBuilder.request(
+            endpoint: endpoint, credentials: credentials
+        ) else {
             await reportError("Invalid Hermes endpoint URL: \(endpoint)")
             return false
         }
@@ -65,7 +75,7 @@ final class HermesAPIClient: NSObject {
         let urlSession = URLSession(configuration: config)
         session = urlSession
 
-        let ws = urlSession.webSocketTask(with: url)
+        let ws = urlSession.webSocketTask(with: request)
         webSocket = ws
         ws.resume()
 
@@ -80,7 +90,14 @@ final class HermesAPIClient: NSObject {
             }
             return true
         } catch {
-            await reportError("Failed to connect to Hermes: \(error.localizedDescription)")
+            // URLSession reports a refused upgrade as "bad server response"
+            // and a bridge-side 4401 as a generic close - neither says which
+            // lock was wrong, so name it from the status / close code.
+            let status = (ws.response as? HTTPURLResponse)?.statusCode
+            let closeCode = ws.closeCode == .invalid ? nil : ws.closeCode.rawValue
+            let hint = BridgeRequestBuilder.failureHint(httpStatus: status, closeCode: closeCode)
+            let detail = hint ?? error.localizedDescription
+            await reportError("Failed to connect to Hermes: \(detail)")
             disconnect()
             return false
         }

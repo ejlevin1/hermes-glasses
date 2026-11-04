@@ -14,6 +14,8 @@
 		AAAA00000000000000000005 /* HermesSessionViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAA00000000000000000105 /* HermesSessionViewModel.swift */; };
 		AAAA00000000000000000006 /* HermesAudioManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAA00000000000000000106 /* HermesAudioManager.swift */; };
 		AAAA00000000000000000007 /* HermesAPIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAA00000000000000000107 /* HermesAPIClient.swift */; };
+		AAAA000000000000000BF0B2 /* BridgeCredentialStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAA000000000000000BF0B3 /* BridgeCredentialStore.swift */; };
+		AAAA000000000000000BF0B0 /* BridgeRequestBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAA000000000000000BF0B1 /* BridgeRequestBuilder.swift */; };
 		AAAA00000000000000000008 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AAAA00000000000000000108 /* Assets.xcassets */; };
 		AAAA00000000000000000009 /* HermesCameraManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAA00000000000000000112 /* HermesCameraManager.swift */; };
 		AAAA00000000000000000010 /* HermesSpeechRecognizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAA00000000000000000113 /* HermesSpeechRecognizer.swift */; };
@@ -178,6 +180,8 @@
 		AAAA00000000000000000105 /* HermesSessionViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesSessionViewModel.swift; sourceTree = "<group>"; };
 		AAAA00000000000000000106 /* HermesAudioManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesAudioManager.swift; sourceTree = "<group>"; };
 		AAAA00000000000000000107 /* HermesAPIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesAPIClient.swift; sourceTree = "<group>"; };
+		AAAA000000000000000BF0B3 /* BridgeCredentialStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeCredentialStore.swift; sourceTree = "<group>"; };
+		AAAA000000000000000BF0B1 /* BridgeRequestBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeRequestBuilder.swift; sourceTree = "<group>"; };
 		AAAA00000000000000000108 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		AAAA00000000000000000109 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		AAAA0000000000000000012A /* Hermes.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Config/Hermes.xcconfig; sourceTree = SOURCE_ROOT; };
@@ -394,6 +398,8 @@
 			children = (
 				AAAA00000000000000000106 /* HermesAudioManager.swift */,
 				AAAA00000000000000000107 /* HermesAPIClient.swift */,
+				AAAA000000000000000BF0B3 /* BridgeCredentialStore.swift */,
+				AAAA000000000000000BF0B1 /* BridgeRequestBuilder.swift */,
 				AAAA00000000000000000112 /* HermesCameraManager.swift */,
 				AAAA00000000000000000113 /* HermesSpeechRecognizer.swift */,
 				AAAA00000000000000000114 /* HermesSpeechSynthesizer.swift */,
@@ -604,6 +610,8 @@
 				AAAA00000000000000000005 /* HermesSessionViewModel.swift in Sources */,
 				AAAA00000000000000000006 /* HermesAudioManager.swift in Sources */,
 				AAAA00000000000000000007 /* HermesAPIClient.swift in Sources */,
+				AAAA000000000000000BF0B2 /* BridgeCredentialStore.swift in Sources */,
+				AAAA000000000000000BF0B0 /* BridgeRequestBuilder.swift in Sources */,
 				AAAA00000000000000000009 /* HermesCameraManager.swift in Sources */,
 				AAAA00000000000000000010 /* HermesSpeechRecognizer.swift in Sources */,
 				AAAA00000000000000000011 /* HermesSpeechSynthesizer.swift in Sources */,
