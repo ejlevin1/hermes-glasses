@@ -351,11 +351,82 @@ final class HermesSessionViewModel {
     var showNotice: Bool = false
     var noticeMessage: String = ""
 
+    /// Endpoint for a fresh install. An endpoint already saved under
+    /// `hermes_endpoint` always wins, so existing users keep theirs.
+    static let defaultHermesEndpoint = "wss://glasses.ericlevin.me/voice"
+
     /// Hermes Agent WebSocket endpoint
     var hermesEndpoint: String {
         (UserDefaults.standard.string(forKey: "hermes_endpoint")
-            ?? "ws://localhost:8765/voice")
+            ?? Self.defaultHermesEndpoint)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Keychain status of the bridge secrets, for Settings. Refreshed by
+    /// `reloadBridgeCredentialState()` / the setters - the Keychain is not
+    /// observable, and reading it from a view body would hit it every redraw.
+    var hasBridgeToken: Bool = BridgeCredentialStore.has(.token)
+    var hasBridgeAccessSecret: Bool = BridgeCredentialStore.has(.accessClientSecret)
+    /// Not a secret on its own (useless without the secret), so Settings
+    /// shows it in a plain field to make a wrong paste visible.
+    var bridgeAccessClientID: String = BridgeCredentialStore.value(for: .accessClientID) ?? ""
+
+    /// The endpoint host the saved secrets are bound to (non-secret, for the
+    /// Settings footer). Empty = bound to nothing, so nothing is sent.
+    var bridgeCredentialHost: String = BridgeCredentialStore.boundHost
+
+    func reloadBridgeCredentialState() {
+        BridgeCredentialStore.migrateBoundHostIfNeeded(currentEndpoint: hermesEndpoint)
+        hasBridgeToken = BridgeCredentialStore.has(.token)
+        hasBridgeAccessSecret = BridgeCredentialStore.has(.accessClientSecret)
+        bridgeAccessClientID = BridgeCredentialStore.value(for: .accessClientID) ?? ""
+        bridgeCredentialHost = BridgeCredentialStore.boundHost
+    }
+
+    /// Save a typed bridge secret. Empty input is NOT a delete for the two
+    /// SecureFields (their text is never pre-filled, so empty just means
+    /// "left alone"); use `clearBridgeCredential` for that. The client ID is
+    /// shown pre-filled, so for it empty does mean remove.
+    ///
+    /// `endpoint` is the endpoint the value was typed for (the one in the
+    /// Settings field, which may not be committed yet): every saved secret is
+    /// bound to its host and only ever sent to that host over `wss://`.
+    func setBridgeCredential(
+        _ value: String, for field: BridgeCredentialStore.Field, boundTo endpoint: String
+    ) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch field {
+        case .token, .accessClientSecret:
+            guard !trimmed.isEmpty else { return }
+        case .accessClientID:
+            guard trimmed != bridgeAccessClientID else { return }
+        }
+        BridgeCredentialStore.set(trimmed, for: field)
+        if trimmed.isEmpty {
+            BridgeCredentialStore.unbindIfEmpty()
+        } else {
+            BridgeCredentialStore.bind(toEndpoint: endpoint)
+        }
+        reloadBridgeCredentialState()
+        if !trimmed.isEmpty, BridgeCredentialStore.value(for: field) == nil {
+            show("Could not save the bridge credential to the Keychain.")
+        }
+    }
+
+    func clearBridgeCredential(_ field: BridgeCredentialStore.Field) {
+        BridgeCredentialStore.clear(field)
+        BridgeCredentialStore.unbindIfEmpty()
+        reloadBridgeCredentialState()
+    }
+
+    /// The ONE way a bridge client is made - session, launch probe and the
+    /// Developer test panel all go through it, so they all carry the same
+    /// token and Cloudflare Access headers.
+    /// The secrets only attach when the endpoint is the `wss://` host they
+    /// were saved for (`BridgeRequestBuilder.request`).
+    private func makeAPIClient() -> HermesAPIClient {
+        BridgeCredentialStore.migrateBoundHostIfNeeded(currentEndpoint: hermesEndpoint)
+        return HermesAPIClient(endpoint: hermesEndpoint, credentials: BridgeCredentialStore.load())
     }
 
     // MARK: - Constants
@@ -1167,7 +1238,7 @@ final class HermesSessionViewModel {
     /// Every bridge callback in one place, so `startSession` reads as the
     /// sequence of steps it is. Returns the client ready to `connect()`.
     private func makeBridgeClient() -> HermesAPIClient {
-        let client = HermesAPIClient(endpoint: hermesEndpoint)
+        let client = makeAPIClient()
 
         client.onTranscript = { [weak self] text in
             Task { @MainActor [weak self] in
@@ -3119,7 +3190,7 @@ final class HermesSessionViewModel {
     func checkBridge() async {
         guard bridgeStatus != .checking else { return }
         bridgeStatus = .checking
-        let probe = HermesAPIClient(endpoint: hermesEndpoint)
+        let probe = makeAPIClient()
         let ok = await probe.connect()
         probe.disconnect()
         bridgeStatus = ok ? .reachable : .unreachable
@@ -3138,7 +3209,7 @@ final class HermesSessionViewModel {
     /// Explicit bridge test: connect + welcome + disconnect
     func testBridge() async {
         await runTest("Bridge") { [self] in
-            let probe = HermesAPIClient(endpoint: hermesEndpoint)
+            let probe = makeAPIClient()
             // Capture the transport-level failure so the test shows WHY
             var underlying = ""
             probe.onError = { message in underlying = message }

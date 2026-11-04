@@ -234,6 +234,15 @@ on your Mac and point the app at it over WebSocket.
    **Settings → Assistant → Backend: Bridge (server)** and set the endpoint
    to `ws://<your-mac-ip>:8765/voice`. The "Bridge" chip in the banner turns
    green when the bridge is reachable.
+4. Reaching the bridge over the internet (e.g. behind a Cloudflare Tunnel
+   protected by Cloudflare Access): under **Settings → Assistant → Bridge
+   access** enter the **Bridge token** (sent as `?token=`, percent-encoded,
+   unless the endpoint already has one) and the Access service token's
+   **Client ID** and **Client Secret** (sent as `CF-Access-Client-Id` /
+   `CF-Access-Client-Secret` headers, only when both are set). All three
+   live in the iPhone Keychain; leave them empty for a LAN bridge. A failed
+   **Settings → Developer → Bridge** test names which lock refused: HTTP
+   403 = Cloudflare Access, close 4401 = bridge token.
 
 The bridge's `HERMES_BRIDGE_BRAIN` env var can also be set to `anthropic`,
 `openai`, or `gemini` to skip the Hermes CLI and call that provider's API
@@ -253,6 +262,12 @@ works with `openai`).
 | Tools / agentic | no | yes |
 | Vision | yes | yes |
 | Keys live in | iPhone Keychain | bridge environment |
+
+## Releasing
+
+TestFlight builds go through fastlane (`bundle exec fastlane test | certs |
+beta`) - see [docs/RELEASE.md](docs/RELEASE.md). All standalone Swift
+suites run with `scripts/run_swift_tests.sh`.
 
 ## Testing
 

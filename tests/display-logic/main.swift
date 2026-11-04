@@ -1,6 +1,8 @@
 //
 // Standalone tests for HermesDisplayLogic - no XCTest target in this
-// project, so these run via swiftc (see command below).
+// project, so these run via swiftc:
+//   xcrun swiftc HermesGlasses/Services/HermesDisplayLogic.swift \
+//     tests/display-logic/main.swift -o /tmp/display-logic-tests && /tmp/display-logic-tests
 //
 
 import Foundation

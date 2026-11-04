@@ -1,0 +1,11 @@
+# Hermes Glasses -- App Store Connect / Apple Developer identity (PLAN.md B2/B5).
+app_identifier("me.ericlevin.hermesglasses")
+team_id("6MPMD6S5U9")
+itc_team_id("6MPMD6S5U9")
+
+# No Apple ID here on purpose: every lane authenticates with the App Store
+# Connect API key (ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH), exactly as Tool
+# Approvals does, so fastlane never needs one and a personal address does not
+# belong in a committed file. Set FASTLANE_APPLE_ID in fastlane/.env.local only
+# if you have to fall back to Apple ID auth.
+apple_id(ENV["FASTLANE_APPLE_ID"]) if ENV["FASTLANE_APPLE_ID"]

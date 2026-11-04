@@ -1,0 +1,343 @@
+# Hermes Glasses -- fastlane lanes (PLAN.md B5). Mirrors Tool Approvals'
+# ios/fastlane: same ASC API key, same match repo, same signing keychain, same
+# environment adoption, same build-number rule.
+#
+# Secrets come from the environment. Nothing secret is ever written to this file
+# or to any file in the repository.
+#
+#   ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH   App Store Connect API key
+#   MATCH_PASSWORD                              match certificate repo passphrase
+#   MATCH_GIT_BASIC_AUTHORIZATION               token to clone the private certs repo
+#   MATCH_KEYCHAIN_NAME / MATCH_KEYCHAIN_PASSWORD
+#                                               the dedicated codesigning keychain
+#                                               a headless session on mbp-m2 needs
+#   ASC_APP_ID (optional)                       numeric Apple ID of the ASC app
+#                                               record, once it exists
+#
+# Three places are read, in order of precedence, and the first one that has a
+# given name wins:
+#
+#   1. the environment, so `VAR=... bundle exec fastlane ios beta` still works;
+#   2. fastlane/.env.local, loaded explicitly below (gitignored; see
+#      .env.local.example) -- fastlane's own dotenv support only reads .env and
+#      .env.default, and .env.<name> only under `--env <name>`;
+#   3. ~/Development/.env/approvals-fastlane and ~/.../approvals-keychain on
+#      mbp-m2 -- the SAME files Tool Approvals reads: one ASC key, one match
+#      passphrase, one signing keychain for both apps.
+#
+# The build machine's hazards (keychain order, match minting certificates,
+# no global git identity) are documented once, in
+# ~/Development/hermes-tool-approvals/ios/docs/BUILD_MACHINE.md. Read it before
+# running `certs` with MATCH_READONLY=0.
+
+require "fileutils"
+require "tmpdir"
+
+default_platform(:ios)
+
+REPO_ROOT = File.expand_path("..", __dir__)
+XCODEPROJ = "HermesGlasses.xcodeproj"
+SCHEME = "HermesGlasses"
+APP_IDENTIFIER = "me.ericlevin.hermesglasses"
+APPSTORE_PROFILE = "match AppStore #{APP_IDENTIFIER}"
+DEVELOPMENT_PROFILE = "match Development #{APP_IDENTIFIER}"
+IPA_NAME = "HermesGlasses.ipa"
+
+# The ASC app record's numeric Apple ID. Not known yet (Eric creates the record
+# by hand -- the ASC API cannot create apps), so it is read from the
+# environment until it can become a constant like Tool Approvals' APPLE_ID.
+# Without it the lanes look the app up by bundle id, which works but is an
+# extra round trip.
+def asc_app_id
+  value = ENV["ASC_APP_ID"]
+  value.nil? || value.strip.empty? ? nil : value.strip
+end
+
+MACHINE_SECRET_FILES = [
+  File.expand_path("~/Development/.env/approvals-fastlane"),
+  File.expand_path("~/Development/.env/approvals-keychain"),
+].freeze
+
+ENV_LOCAL_FILE = File.expand_path(".env.local", __dir__)
+
+# Parses `export KEY=value` / `KEY=value`, ignoring comments and blank lines.
+# Values are not expanded and not logged; only the *names* found are reported.
+def adopt_env_file(path)
+  return unless File.exist?(path)
+
+  adopted = []
+  File.foreach(path) do |line|
+    line = line.strip
+    next if line.empty? || line.start_with?("#")
+
+    match = line.match(/\A(?:export\s+)?([A-Z_][A-Z0-9_]*)=(.*)\z/)
+    next if match.nil?
+
+    name, value = match[1], match[2].strip
+    # Strip one layer of surrounding quotes, which is all a shell would.
+    value = value[1..-2] if value.length >= 2 && (value.start_with?('"') || value.start_with?("'")) &&
+      value[-1] == value[0]
+    next if value.empty?
+    # The environment wins over every file.
+    next unless ENV[name].nil? || ENV[name].empty?
+
+    ENV[name] = value
+    adopted << name
+  end
+  UI.message("Loaded #{adopted.join(', ')} from #{path}") unless adopted.empty?
+end
+
+[ENV_LOCAL_FILE, *MACHINE_SECRET_FILES].each { |path| adopt_env_file(path) }
+
+# The DAT SDK is a SwiftPM package; a headless run cannot answer Xcode's
+# "trust this plugin/macro" prompts, so every xcodebuild skips them.
+XCODE_SKIP_VALIDATION = "-skipPackagePluginValidation -skipMacroValidation"
+
+def load_asc_api_key
+  key_id = ENV["ASC_KEY_ID"]
+  issuer_id = ENV["ASC_ISSUER_ID"]
+  key_path = ENV["ASC_KEY_PATH"]
+
+  missing = { "ASC_KEY_ID" => key_id, "ASC_ISSUER_ID" => issuer_id, "ASC_KEY_PATH" => key_path }
+            .select { |_, v| v.nil? || v.empty? }.keys
+  unless missing.empty?
+    UI.important("App Store Connect API key not configured (missing #{missing.join(', ')}).")
+    UI.important("Copy fastlane/.env.local.example to fastlane/.env.local and fill it in.")
+    return nil
+  end
+
+  expanded = File.expand_path(key_path)
+  UI.user_error!("ASC_KEY_PATH does not exist: #{expanded}") unless File.exist?(expanded)
+
+  app_store_connect_api_key(
+    key_id: key_id,
+    issuer_id: issuer_id,
+    key_filepath: expanded,
+    in_house: false
+  )
+end
+
+# Unlock the dedicated codesigning keychain. Neither match nor gym unlocks a
+# keychain, and `add_to_search_list: false` is deliberate: the default appends,
+# which would put approvals-signing BEHIND login.keychain-db and make
+# distribution signing fail with errSecInternalComponent (BUILD_MACHINE.md).
+def unlock_signing_keychain
+  name = ENV["MATCH_KEYCHAIN_NAME"]
+  password = ENV["MATCH_KEYCHAIN_PASSWORD"]
+  if name.nil? || name.empty? || password.nil? || password.empty?
+    UI.important("MATCH_KEYCHAIN_NAME/_PASSWORD are not set; relying on the default keychain for signing.")
+    return
+  end
+
+  UI.message("Unlocking the #{name} keychain for signing")
+  unlock_keychain(
+    path: name,
+    password: password,
+    add_to_search_list: false,
+    set_default: false
+  )
+end
+
+# Config/Secrets.xcconfig (Meta DAT app id + client token) is gitignored, so a
+# fresh release clone has none -- and without it the app builds against the
+# placeholders in Hermes.xcconfig and cannot reach the glasses at runtime, with
+# nothing in the build log. `required: false` (the test lane) only warns.
+def ensure_secrets(required: true)
+  dest = File.join(REPO_ROOT, "Config", "Secrets.xcconfig")
+  return if File.exist?(dest)
+
+  script = File.join(REPO_ROOT, "scripts", "write_secrets.sh")
+  if required
+    sh(script)
+  else
+    begin
+      sh(script)
+    rescue StandardError
+      UI.important("No Meta DAT secrets on this machine; building against the placeholders.")
+    end
+  end
+end
+
+# The 1024 icon must have no alpha channel or App Store processing rejects the
+# upload -- after the archive, so check before anything expensive starts.
+def check_app_icon
+  icons = Dir[File.join(REPO_ROOT, "HermesGlasses", "Assets.xcassets", "AppIcon.appiconset", "*.png")]
+  UI.user_error!("no app icon PNGs found") if icons.empty?
+  icons.each do |icon|
+    alpha = `sips -g hasAlpha "#{icon}"`[/hasAlpha:\s*(\w+)/, 1]
+    UI.user_error!("#{File.basename(icon)} has an alpha channel; App Store processing will reject it") if alpha == "yes"
+  end
+  UI.success("App icon has no alpha channel")
+end
+
+# Assert, on the signed artefact, what nothing else checks and what fails
+# silently if wrong. Prints key NAMES and booleans only -- never a value from
+# the plist (the Meta client token is in there).
+#
+#   * the Hotspot Configuration and Wi-Fi Info entitlements are present (the
+#     AiSee livestream joins the glasses' hotspot; without them it just fails);
+#   * the build number is the one we computed;
+#   * the Meta DAT credentials were substituted (MetaAppID not the "0"
+#     placeholder, ClientToken non-empty) -- i.e. Config/Secrets.xcconfig was
+#     really there when the archive was built.
+def verify_ipa(ipa, build_number:)
+  UI.user_error!("no IPA at #{ipa}") unless File.exist?(ipa)
+
+  Dir.mktmpdir("hg-ipa-verify") do |dir|
+    sh("unzip", "-q", ipa, "-d", dir, log: false)
+    app = Dir[File.join(dir, "Payload", "*.app")].first
+    UI.user_error!("#{ipa} has no Payload/*.app") if app.nil?
+
+    entitlements = `codesign -d --entitlements :- "#{app}" 2>/dev/null`
+    %w[com.apple.developer.networking.HotspotConfiguration com.apple.developer.networking.wifi-info].each do |key|
+      UI.user_error!("the signed app lacks the #{key} entitlement") unless entitlements.include?("<key>#{key}</key>")
+    end
+
+    plist = File.join(app, "Info.plist")
+    read = lambda do |key_path|
+      out = `/usr/libexec/PlistBuddy -c "Print :#{key_path}" "#{plist}" 2>/dev/null`
+      $?.success? ? out.strip : nil
+    end
+    version = read.call("CFBundleVersion")
+    UI.user_error!("CFBundleVersion is #{version.inspect}, expected #{build_number}") unless version == build_number.to_s
+    app_id = read.call("MWDAT:MetaAppID")
+    token = read.call("MWDAT:ClientToken")
+    if app_id.nil? || app_id.empty? || app_id == "0" || token.nil? || token.empty?
+      UI.user_error!("MWDAT MetaAppID/ClientToken are placeholders; Config/Secrets.xcconfig was missing at build time")
+    end
+
+    UI.success("IPA verified: Hotspot + Wi-Fi Info entitlements, CFBundleVersion #{build_number}, Meta DAT credentials present")
+  end
+end
+
+platform :ios do
+  desc "Fetch (or, with MATCH_READONLY=0, create) the App Store signing profile"
+  desc "(+ development with MATCH_DEVELOPMENT=1). Read-only by default. Read"
+  desc "hermes-tool-approvals/ios/docs/BUILD_MACHINE.md before MATCH_READONLY=0."
+  lane :certs do
+    api_key = load_asc_api_key
+    readonly = ENV["MATCH_READONLY"] != "0"
+    unlock_signing_keychain
+
+    unless readonly
+      # The certificates (distribution ZBZU9783S4, development 76B22RR6W7)
+      # already exist in aapi-match-certs; this run must only create the
+      # PROFILES for the new app id. If match reports generating a
+      # certificate, stop: that is a burned slot (BUILD_MACHINE.md).
+      UI.important("MATCH_READONLY=0: match may CREATE profiles -- and certificates if one is missing from the repo.")
+      # match writes these into its temp clone's local config only. Without
+      # them the push fails on mbp-m2 and match reports it as a warning,
+      # exiting 0 with the new material orphaned.
+      ENV["MATCH_GIT_FULL_NAME"] ||= "Eric LeVin"
+      ENV["MATCH_GIT_USER_EMAIL"] ||= "eric@ericlevin.me"
+    end
+
+    types = ["appstore"]
+    types << "development" if ENV["MATCH_DEVELOPMENT"] == "1"
+    types.each do |profile_type|
+      match(
+        type: profile_type,
+        app_identifier: [APP_IDENTIFIER],
+        readonly: readonly,
+        api_key: api_key
+      )
+    end
+  end
+
+  desc "Build and upload a build to TestFlight (internal testing only)."
+  desc "`skip_upload:true` stops after the signed archive + export + IPA check."
+  lane :beta do |options|
+    skip_upload = options[:skip_upload].to_s == "true"
+
+    ensure_secrets(required: true)
+    check_app_icon
+
+    api_key = load_asc_api_key
+    UI.user_error!("beta needs the App Store Connect API key; see fastlane/.env.local.example") if api_key.nil?
+
+    unlock_signing_keychain
+
+    # readonly: the release path has no write access to the certs repo and
+    # cannot mint a certificate. The profile must already exist (`certs`).
+    match(
+      type: "appstore",
+      app_identifier: [APP_IDENTIFIER],
+      readonly: true,
+      api_key: api_key
+    )
+
+    # Build number = latest TestFlight build + 1 (0 when there is none), so the
+    # tree needs no bookkeeping and two machines cannot collide.
+    latest_args = {
+      app_identifier: APP_IDENTIFIER,
+      api_key: api_key,
+      initial_build_number: 0
+    }
+    latest = latest_testflight_build_number(**latest_args)
+    build_number = latest.to_i + 1
+    UI.success("Building build number #{build_number}")
+
+    # Passed to xcodebuild rather than written into the tree (no agvtool:
+    # Info.plist's CFBundleVersion is $(CURRENT_PROJECT_VERSION), and agvtool
+    # would replace that indirection with a literal). Signing for Release is
+    # already manual in the project (Apple Distribution + APPSTORE_PROFILE,
+    # iphoneos only), so nothing about signing is overridden here -- an
+    # xcargs PROVISIONING_PROFILE_SPECIFIER would also hit the SwiftPM targets.
+    build_app(
+      project: XCODEPROJ,
+      scheme: SCHEME,
+      configuration: "Release",
+      xcargs: "#{XCODE_SKIP_VALIDATION} CURRENT_PROJECT_VERSION=#{build_number}",
+      export_method: "app-store",
+      destination: "generic/platform=iOS",
+      derived_data_path: "build/DerivedData",
+      output_directory: "build",
+      output_name: IPA_NAME,
+      export_options: {
+        provisioningProfiles: { APP_IDENTIFIER => APPSTORE_PROFILE }
+      }
+    )
+
+    ipa = File.join(REPO_ROOT, "build", IPA_NAME)
+    verify_ipa(ipa, build_number: build_number)
+
+    if skip_upload
+      UI.success("skip_upload: signed IPA at #{ipa} (build #{build_number}); nothing uploaded")
+      next
+    end
+
+    upload_args = {
+      api_key: api_key,
+      app_identifier: APP_IDENTIFIER,
+      ipa: ipa,
+      skip_waiting_for_build_processing: true,
+      skip_submission: true,
+      distribute_external: false
+    }
+    upload_args[:apple_id] = asc_app_id if asc_app_id
+    upload_to_testflight(**upload_args)
+    UI.success("Uploaded build #{build_number} to TestFlight (internal testing; processing continues on Apple's side)")
+  end
+
+  desc "Build for the simulator (unsigned) and run every standalone Swift suite"
+  desc "in tests/ (scripts/run_swift_tests.sh). There is no XCTest target."
+  lane :test do
+    ensure_secrets(required: false)
+
+    # `sh` runs in fastlane/, so every path is absolute. Unsigned on purpose:
+    # a headless session on the build machine has no usable identity.
+    sh(
+      "xcodebuild",
+      "-project", File.join(REPO_ROOT, XCODEPROJ),
+      "-scheme", SCHEME,
+      "-configuration", "Debug",
+      "-destination", "generic/platform=iOS Simulator",
+      "-derivedDataPath", File.join(REPO_ROOT, "build", "DerivedData"),
+      *XCODE_SKIP_VALIDATION.split,
+      "CODE_SIGNING_ALLOWED=NO",
+      "build"
+    )
+
+    sh(File.join(REPO_ROOT, "scripts", "run_swift_tests.sh"))
+  end
+end

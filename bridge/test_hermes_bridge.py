@@ -3,6 +3,7 @@ import base64
 import os
 import tempfile
 import unittest
+import unittest.mock
 
 import hermes_bridge as hb
 from hermes_bridge import (
@@ -368,6 +369,95 @@ class ProviderRequestTests(unittest.TestCase):
         url, _, _ = build_provider_request(
             "claude", "claude-opus-4-8", "https://api.anthropic.com", "k", "hi", None)
         self.assertTrue(url.endswith("/v1/messages"))
+
+
+class AskHermesChildProcessTests(unittest.TestCase):
+    """The argv and the environment handed to the hermes CLI.
+
+    Both of these are invisible from the outside: a leaked token produces a
+    perfectly normal answer, and a query eaten by argparse produces a usage
+    error that looks like the agent said something odd. So they are asserted
+    on the call itself.
+    """
+
+    def setUp(self):
+        self.calls = []
+
+        def fake_run(cmd, **kwargs):
+            self.calls.append((cmd, kwargs))
+            return unittest.mock.Mock(stdout="ok", stderr="", returncode=0)
+
+        patcher = unittest.mock.patch.object(hb.subprocess, "run", fake_run)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @property
+    def argv(self):
+        return self.calls[0][0]
+
+    @property
+    def env(self):
+        return self.calls[0][1]["env"]
+
+    def test_query_passed_as_single_equals_argument(self):
+        hb.ask_hermes("what is the weather")
+        self.assertIn("--query=what is the weather", self.argv)
+        # the old two-token form must be gone, or a leading "-" is an option
+        self.assertNotIn("-q", self.argv)
+
+    def test_query_starting_with_dash_is_not_parsed_as_an_option(self):
+        # "-q -foo" made argparse fail with "expected one argument"; every
+        # one of these reaches the CLI as a single token now.
+        for text in ["-foo", "--help", "-ish, maybe", "--image /etc/passwd"]:
+            self.calls.clear()
+            hb.ask_hermes(text)
+            self.assertIn(f"--query={text}", self.argv, text)
+            # exactly one argv entry carries the user's text, so the CLI
+            # cannot read part of it as a flag of its own
+            carriers = [a for a in self.argv if text in a]
+            self.assertEqual(carriers, [f"--query={text}"], text)
+
+    def test_image_and_resume_still_passed(self):
+        hb.ask_hermes("look", image_path="/tmp/x.jpg", resume="sess-1")
+        self.assertIn("--image", self.argv)
+        self.assertIn("/tmp/x.jpg", self.argv)
+        self.assertIn("--resume", self.argv)
+        self.assertIn("sess-1", self.argv)
+
+    def test_bridge_token_is_not_in_the_child_environment(self):
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"HERMES_BRIDGE_TOKEN": "s3cret-token", "ANTHROPIC_API_KEY": "k"},
+        ):
+            hb.ask_hermes("hi")
+        self.assertNotIn("HERMES_BRIDGE_TOKEN", self.env)
+        self.assertNotIn("s3cret-token", self.env.values())
+
+    def test_everything_else_is_still_inherited(self):
+        # The hermes CLI needs its own provider keys, PATH and HOME; only the
+        # one variable is stripped.
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"HERMES_BRIDGE_TOKEN": "s3cret", "ANTHROPIC_API_KEY": "k",
+             "HOME": "/Users/test", "HERMES_BRIDGE_PORT": "8766"},
+        ):
+            hb.ask_hermes("hi")
+        self.assertEqual(self.env["ANTHROPIC_API_KEY"], "k")
+        self.assertEqual(self.env["HOME"], "/Users/test")
+        # a *different* HERMES_BRIDGE_* name must survive - the strip is by
+        # exact name, not by prefix
+        self.assertEqual(self.env["HERMES_BRIDGE_PORT"], "8766")
+        self.assertEqual(self.env["HERMES_NO_COLOR"], "1")
+
+    def test_env_builder_is_a_plain_copy_when_no_token_is_set(self):
+        env_without = dict(os.environ)
+        env_without.pop("HERMES_BRIDGE_TOKEN", None)
+        with unittest.mock.patch.dict(os.environ, env_without, clear=True):
+            built = hb.hermes_child_env()
+        self.assertEqual(
+            {k: v for k, v in built.items() if k != "HERMES_NO_COLOR"},
+            env_without,
+        )
 
 
 if __name__ == "__main__":

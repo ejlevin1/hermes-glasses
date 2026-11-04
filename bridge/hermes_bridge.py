@@ -450,6 +450,20 @@ def extract_hermes_reply(raw: str) -> str | None:
     return reply or None
 
 
+def hermes_child_env() -> dict[str, str]:
+    """The environment for the hermes child process.
+
+    HERMES_BRIDGE_TOKEN is stripped. The child is an agent WITH TOOLS - it
+    can read its own environment and report what it finds - so passing the
+    bridge's shared secret down to it hands the key to the lock to anything
+    that can get a question answered. Nothing else is removed: the hermes
+    CLI needs its own provider keys, PATH, HOME and the rest to work at all.
+    """
+    env = {k: v for k, v in os.environ.items() if k != "HERMES_BRIDGE_TOKEN"}
+    env["HERMES_NO_COLOR"] = "1"
+    return env
+
+
 def ask_hermes(
     text: str,
     image_path: str | None = None,
@@ -460,7 +474,11 @@ def ask_hermes(
     Returns (reply, session_id). session_id enables conversation memory
     via --resume on the next query; either value may be None.
     """
-    cmd = [HERMES_BIN, "chat", "-q", text, "-Q", "--cli"]
+    # --query=<text>, not ["-q", text]: argparse reads a value beginning with
+    # "-" as the next option, so an utterance transcribed as "-ish, maybe"
+    # or "--help me out" made the hermes CLI exit with a usage error instead
+    # of answering. The "=" form is unambiguous for any text at all.
+    cmd = [HERMES_BIN, "chat", f"--query={text}", "-Q", "--cli"]
     if image_path:
         cmd += ["--image", image_path]
     if resume:
@@ -471,7 +489,7 @@ def ask_hermes(
             capture_output=True,
             text=True,
             timeout=120 if image_path else 60,
-            env={**os.environ, "HERMES_NO_COLOR": "1"},
+            env=hermes_child_env(),
         )
         session_id = extract_session_id(result.stderr)
         output = result.stdout.strip()
