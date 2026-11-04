@@ -38,6 +38,7 @@ files), so no `set -a; . …` preamble is needed. Only variable *names* are ever
 | `MATCH_READONLY=0 bundle exec fastlane certs` | **one time only**: creates the profiles for this new app id, reusing the existing certificates (distribution `ZBZU9783S4`, development `76B22RR6W7`). Abort if match says it is generating a certificate. Never `match nuke`. | writes |
 | `bundle exec fastlane beta skip_upload:true` | secrets → icon check → keychain unlock → match (read-only) → build number = latest TestFlight + 1 → signed Release archive + app-store export → IPA check. Stops before upload. IPA at `build/HermesGlasses.ipa`. | reads |
 | `bundle exec fastlane beta` | the same, then `upload_to_testflight` (internal only, `skip_waiting_for_build_processing`) | reads |
+| `bundle exec fastlane beta build_number:<n>` | the same with an explicit build number (must exceed the latest TestFlight build); use it after Apple rejects an upload in processing, because a rejected upload never becomes a build but its number stays taken | reads |
 
 The IPA check asserts, on the signed artefact: the Hotspot Configuration + Wi-Fi Info entitlements, the
 computed `CFBundleVersion`, and that the Meta DAT credentials were substituted (not the `0` placeholder).

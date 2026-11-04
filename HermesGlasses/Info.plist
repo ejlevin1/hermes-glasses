@@ -66,8 +66,12 @@
 	<string>Hermes connects to your smart glasses (Meta Ray-Ban or AiSee) over Bluetooth.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Hermes Glasses uses this iPhone's camera as the eye in phone mode, when you have no glasses on: the live view stays on your phone and a frame is sent to the assistant only when you ask about what you're looking at.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>Hermes Glasses does not read your contacts. The AiSee glasses SDK bundled with the app links the Contacts framework, so iOS requires this explanation.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Hermes Glasses connects to the Hermes bridge running on your Mac over the local network and receives AiSee glasses video over a local Wi-Fi hotspot.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Hermes Glasses only uses your location while the app is in use, to answer questions about where you are, nearby places, directions, and the weather.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>Hermes Glasses shares your approximate location with the assistant so it can answer questions about where you are, nearby places, and the weather.</string>
 	<key>NSMicrophoneUsageDescription</key>
